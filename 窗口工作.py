@@ -63,6 +63,9 @@ bgserver.py —— 后台点击/截图的常驻本地服务（供 agent skill �
   6. /key 接口 —— 键盘输入。单键、组合键（ctrl+shift+s）、多键同按（按住不放）、
      逐字符真按键。走 WM_KEYDOWN/WM_KEYUP + 规范 lParam，不是原来只有的 WM_CHAR。
      原来的 /text 保留不动（纯字符通道，适合中英文文本）。
+  7. /mouse 接口 —— 鼠标滑动 / 拖拽 / 滚轮。相对位移、绝对坐标、途经点、手势，
+     以及按住拖动（每步带按键状态位，否则程序会认为中途松手）。
+     坐标是客户区坐标；滚轮的 lParam 用屏幕坐标（Windows 规定）。
 """
 
 from __future__ import annotations
@@ -88,7 +91,7 @@ from urllib.parse import urlparse, parse_qs
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bgclick as bc  # noqa: E402
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DEFAULT_PORT = 8765
 
 # 允许截图落盘的根目录（启动时填充为绝对路径）
@@ -441,6 +444,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_text(body)
             elif u.path == "/key":
                 self._handle_key(body)
+            elif u.path == "/mouse":
+                self._handle_mouse(body)
             elif u.path == "/window":
                 # 客户端用 POST 发目标信息（和 click/shot 保持一致），
                 # 所以这里也要收 POST —— 只注册 GET 会让它 404。
@@ -724,6 +729,45 @@ class Handler(BaseHTTPRequestHandler):
         # 和 /click 一样：投递没成功就该让调用方看到失败（退出码 1）
         self._send(200 if result.get("ok") else 400,
                    {"ok": bool(result.get("ok")), "key": result, "target": hex(dest)})
+
+    def _handle_mouse(self, body: dict) -> None:
+        """
+        模拟鼠标滑动 / 拖拽 / 滚轮。和点击一样走消息投递，不动真实光标、不抢焦点。
+
+        五种玩法（一次只用一种）：
+
+          1. 相对滑动（最常用）      {"dx": 0, "dy": -500}        向上滑 500 像素
+          2. 滑到绝对坐标            {"to": [400, 300]}
+          3. 途经点轨迹              {"path": [[100,100],[300,300],[500,200]]}
+          4. 手势                    {"pattern": "circle", "distance": 200}
+                                     pattern: line/up/down/left/right/circle/square/zigzag
+          5. 滚轮                    {"scroll": -5}               向下滚 5 格
+                                     {"scroll": 3, "axis": "horizontal"}  向右滚
+
+        拖动类（滑块、列表内容、地图、画布）加 "button" 就变成按住拖动：
+            {"from": [200, 400], "dy": -300, "button": "left"}
+
+        ★ 滑动不是「发一条消息」：
+          拖动交互靠**连续的 WM_MOUSEMOVE** 累积，所以默认按 steps=30 插值走过去，
+          每一步都规范地带上按键状态位（MK_LBUTTON 等）—— 不带的话程序认为
+          中途已经松手，拖动会断在起点。delay 控制每步间隔，duration 可以直接
+          指定整段时长（给「要拖 1 秒」这种需求用）。
+
+        ★ 坐标是客户区坐标；滚轮的 lParam 按 Windows 规定用屏幕坐标，库内部换算。
+
+        ★ 只支持 post / send。真拖拽要抢占用户的真实光标，是前台行为，本接口不做。
+        """
+        target = find_target(body)
+        args = argparse.Namespace(hwnd_int=target["hwnd"])
+        started = time.time()
+        result = bc.do_mouse(args, body)
+        result["elapsed"] = round(time.time() - started, 3)
+        result["hwnd"] = target["hwnd_hex"]
+        result["title"] = target["title"]
+        result["process"] = target["process"]
+        self._send(200 if result.get("ok") else 400,
+                   {"ok": bool(result.get("ok")), "mouse": result,
+                    "target": result.get("hwnd")})
 
 
 # --------------------------------------------------------------------------

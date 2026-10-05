@@ -14,6 +14,8 @@ bgclient.py —— bgserver 的命令行客户端（也给 agent skill 当调用
   python bgclient.py text --title "记事本" --text "hello" --enter
   python bgclient.py key  --title "记事本" --keys ctrl+shift+s     # 组合键
   python bgclient.py key  --title "记事本" --hold ctrl+shift+a     # 多键同按
+  python bgclient.py mouse --title "记事本" --delta 0,-500         # 向上滑动
+  python bgclient.py mouse --title "记事本" --scroll -5            # 向下滚 5 格
   python bgclient.py shutdown                     # 停服务
 
 自动化友好
@@ -297,6 +299,9 @@ class Client:
     def key(self, **kw) -> dict:
         return self._request("POST", "/key", kw)
 
+    def mouse(self, **kw) -> dict:
+        return self._request("POST", "/mouse", kw)
+
     def shutdown(self) -> dict:
         return self._request("GET", "/shutdown")
 
@@ -457,6 +462,35 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--with-char", dest="char", action="store_true", default=None,
                     help="强制补 WM_CHAR（Ctrl/Alt 组合默认是不补的）")
 
+    sp = add("mouse", "鼠标滑动 / 拖拽 / 滚轮（走消息投递，不动真实光标）")
+    add_target_args(sp)
+    sp.add_argument("--from", dest="from_pos", type=parse_pair,
+                    help="起点客户区坐标 X,Y（默认客户区中心）")
+    g = sp.add_mutually_exclusive_group(required=True)
+    g.add_argument("--delta", type=parse_pair, metavar="DX,DY",
+                   help="相对滑动，如 --delta 0,-500（向上滑 500 像素）")
+    g.add_argument("--to", dest="to_pos", type=parse_pair, help="滑到绝对客户区坐标 X,Y")
+    g.add_argument("--path", help='途经点，形如 "100,100;300,300;500,200"')
+    g.add_argument("--pattern", choices=["line", "up", "down", "left", "right",
+                                         "circle", "square", "zigzag"],
+                   help="手势轨迹（圆/方/锯齿默认绕回起点）")
+    g.add_argument("--scroll", type=int, help="滚轮格数（正数向上/向左，负数向下/向右）")
+    sp.add_argument("--axis", default="vertical", choices=["vertical", "horizontal"],
+                    help="滚轮方向轴（配合 --scroll）")
+    sp.add_argument("--drag", action="store_true", help="按住拖动（起点按下，全程保持）")
+    sp.add_argument("--button", default="left", choices=["left", "right", "middle"],
+                    help="拖拽用哪个键（默认 left）")
+    sp.add_argument("--distance", type=int, default=300, help="手势轨迹尺度（像素，默认 300）")
+    sp.add_argument("--steps", type=int, default=30, help="插值步数（默认 30）")
+    sp.add_argument("--duration", type=float, help="整段滑动的总时长秒")
+    sp.add_argument("--delay", type=float, default=0.02, help="每步间隔秒（默认 0.02）")
+    sp.add_argument("--hold", type=float, default=0.03, help="按下/抬起前停顿秒")
+    sp.add_argument("--ease", action="store_true", help="平滑加减速，更像人手")
+    sp.add_argument("--no-release", dest="release", action="store_false", default=True,
+                    help="拖完不抬键（慎用）")
+    sp.add_argument("--method", default="post", choices=["post", "send"],
+                    help="投递方式（默认 post 纯后台）")
+
     return p
 
 
@@ -588,6 +622,57 @@ def main(argv: list[str] | None = None) -> int:
                 what = args.hold or ("+".join(args.keys) if args.keys else args.typed)
                 human = (f"已投递 {k.get('sent')} 条键盘消息（{what}，"
                          f"目标 {k.get('title')}，{k.get('elapsed')}s）")
+            return emit(r, as_json, human)
+
+        if args.cmd == "mouse":
+            body = target_payload(args)
+            body.update({"method": args.method, "steps": args.steps, "hold": args.hold,
+                         "ease": args.ease, "distance": args.distance,
+                         "release": args.release})
+            if args.delay != 0.02:
+                body["delay"] = args.delay
+            if args.from_pos:
+                body["from"] = args.from_pos
+            if args.duration is not None:
+                body["duration"] = args.duration
+            if args.scroll is not None:
+                body["scroll"] = args.scroll
+                body["axis"] = args.axis
+            elif args.pattern:
+                body["pattern"] = args.pattern
+            elif args.path:
+                pts = []
+                for chunk in args.path.replace("，", ",").split(";"):
+                    chunk = chunk.strip()
+                    if not chunk:
+                        continue
+                    try:
+                        a, b = chunk.split(",")
+                        pts.append([int(a.strip(), 0), int(b.strip(), 0)])
+                    except Exception:
+                        raise SystemExit(
+                            f"--path 格式应为 \"x,y;x,y\"，收到 {chunk!r}")
+                body["path"] = pts
+            elif args.to_pos:
+                body["to"] = args.to_pos
+            else:
+                body["dx"], body["dy"] = args.delta
+            if args.drag:
+                body["button"] = args.button
+            elif args.button != "left":
+                body["button"] = args.button
+            r = client.mouse(**body)
+            human = None
+            if r.get("ok"):
+                m = r.get("mouse", {})
+                if m.get("mode") == "scroll":
+                    human = (f"已滚 {m.get('amount')} 格（{m.get('axis')}），"
+                             f"投递 {m.get('sent')} 条消息（目标 {m.get('title')}）")
+                else:
+                    human = (f"{'拖拽' if m.get('mode') == 'drag' else '滑动'} "
+                             f"{m.get('from')} → {m.get('to')}，"
+                             f"{m.get('steps')} 步 / {m.get('sent')} 条消息"
+                             f"（目标 {m.get('title')}）")
             return emit(r, as_json, human)
 
         return 1

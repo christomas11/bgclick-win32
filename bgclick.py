@@ -49,6 +49,19 @@ bgclick.py —— Windows 后台窗口点击器（纯消息投递，不抢光标
    lParam 按 Windows 规范组装（扫描码 / 扩展键 / Alt 的 SYS 消息升级都处理了），
    Alt 组合会自动走 WM_SYSKEYDOWN/UP。详见「键盘」那一节的注释。
 
+鼠标滑动 / 拖拽 / 滚轮（1.2.0 新增）
+------------------------------------
+   do_mouse(args, body)   统一入口，服务端 /mouse 和 CLI 共用
+   mouse_swipe(...)       悬停滑动：只发 WM_MOUSEMOVE，wParam=0
+   mouse_drag(...)        ★ 拖拽：每一步的移动消息都带 MK_LBUTTON 等按键状态位。
+                          不带的话程序认为中途已经松手，拖动会断在起点 ——
+                          这是滑动类需求最常见的坑，别省这一步。
+   mouse_scroll(...)      滚轮：wParam 高 16 位是增量，lParam 用**屏幕坐标**
+   plan_path(...)         直线插值；取整用 round（用 int 会让短距离滑动全塌到起点）
+
+   ★ 滑动不是「发一条消息」：拖动靠连续 WM_MOUSEMOVE 累积，所以默认按 30 步
+     插值走过去。步数少 = 程序判成 0 距离；步数多 = 慢，但更像人手。
+
 权限（重要！）
 --------------
 Windows 的 UIPI（用户界面特权隔离）规则：**只有完整性级别(IL) >= 目标 IL 的进程，
@@ -259,6 +272,9 @@ user32.ToUnicodeEx.argtypes = [
     wintypes.LPWSTR, ctypes.c_int, wintypes.UINT, wintypes.HKL,
 ]
 user32.ToUnicodeEx.restype = ctypes.c_int
+
+# 滚轮消息：竖滚 / 横滚。wParam 高 16 位是增量，lParam 是**屏幕坐标**。
+WM_MOUSEWHEEL, WM_MOUSEHWHEEL = 0x020A, 0x020E
 
 user32.GetSystemMetrics.argtypes = [ctypes.c_int]
 user32.GetSystemMetrics.restype = ctypes.c_int
@@ -821,6 +837,462 @@ def do_click(hwnd: int, x: int, y: int, args) -> dict:
     if args.method == "send":
         return send_click_send(hwnd, x, y, args.button)
     return send_click_hardware(hwnd, x, y, args.button, restore_cursor=args.restore_cursor)
+
+
+# --------------------------------------------------------------------------
+# 鼠标滑动 / 拖拽 / 滚轮（同样是消息投递，不抢光标）
+# --------------------------------------------------------------------------
+#
+# 为什么滑动不是「发一条消息」就完事：
+#   拖动类交互（滑块、列表内容、地图、画布）都是靠**连续的 WM_MOUSEMOVE**
+#   累积出来的。中间不补点，程序看到的就是「起点按下 → 瞬移到终点 → 抬起」，
+#   要么当没发生，要么判成 0 距离。所以必须按步数插值，一步步走过去。
+#
+# ★ 拖动期间每条移动消息的 wParam 必须带 MK_LBUTTON（按键状态位）。
+#   不带的话程序认为「按键已经松了」，拖动直接断在原地 —— 这是最常见的坑。
+#   同理，拖右键要带 MK_RBUTTON。
+#
+# ★ 坐标是**客户区坐标**，插值时按客户区线性走。
+#   如果目标内部还有自己的滚动偏移（画布类控件），程序会自己换算，
+#   我们只管把客户区坐标走对。
+#
+# ★ 同样受 UIPI 约束：低完整性级别发不进高完整性级别的窗口。
+#   消息被拒（错误码 5）时立即停手，不会把剩下的步数白跑一遍。
+
+MK_SHIFT, MK_CONTROL = 0x0004, 0x0008
+WHEEL_DELTA = 120
+
+
+def _clamp_int(value, lo: int, hi: int, name: str, default: int) -> int:
+    """整数范围校验。服务端有自己的 clamp_int，这里是库内的等价物，避免跨文件依赖。"""
+    if value is None:
+        return default
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise AppError(f"{name} 必须是整数，收到 {value!r}", code=2)
+    if n < lo or n > hi:
+        raise AppError(f"{name} 超出允许范围 [{lo}, {hi}]，收到 {n}", code=2)
+    return n
+
+
+def _mouse_move_msg(hwnd: int, x: int, y: int, mk: int, method: str) -> tuple[bool, int]:
+    """投递一条带按键状态的 WM_MOUSEMOVE。"""
+    lp = make_lparam(x, y)
+    if method == "send":
+        out = ctypes.c_size_t(0)
+        ctypes.set_last_error(0)
+        res = user32.SendMessageTimeoutW(hwnd, WM_MOUSEMOVE, mk, lp,
+                                         SMTO_ABORTIFHUNG | SMTO_BLOCK, 1000,
+                                         ctypes.byref(out))
+        err = ctypes.get_last_error()
+        if res == 0 and err:
+            return False, err
+        return True, 0
+    return post_checked(hwnd, WM_MOUSEMOVE, mk, lp)
+
+
+def plan_path(x0: int, y0: int, x1: int, y1: int, steps: int,
+              ease: bool = False) -> list[tuple[int, int]]:
+    """
+    把一段直线拆成 steps 个点（不含起点，含终点）。
+
+    steps=0 时返回空列表，调用方自己补一条到终点的移动。
+    ease=True 用 smoothstep 平滑速度（起步慢、中间快、收尾慢），
+    比匀速更像人手 —— 有些程序就是这么判断「像不像真人操作」的。
+
+    ★ 取整用 round 而不是 int：int 会一路向下取整，短距离滑动
+      （比如 10 像素分 20 步）会全部塌到起点，滑动等于没发生。
+    """
+    if steps <= 0:
+        return []
+    pts: list[tuple[int, int]] = []
+    for i in range(1, steps + 1):
+        t = i / steps
+        if ease:
+            t = t * t * (3.0 - 2.0 * t)      # smoothstep
+        px = round(x0 + (x1 - x0) * t)
+        py = round(y0 + (y1 - y0) * t)
+        if pts and pts[-1] == (px, py):
+            continue                          # 去重：重复点对程序没有意义
+        pts.append((px, py))
+    if not pts or pts[-1] != (x1, y1):
+        pts.append((x1, y1))                  # 终点必须精确落在目标上
+    return pts
+
+
+def _path_from_spec(hwnd: int, start: tuple[int, int], body: dict) -> tuple[list[tuple[int, int]], dict]:
+    """
+    把请求里的路径写法解析成点序列。支持四种：
+
+      dx/dy        相对滑动（最常用）：dx=0, dy=-500 → 向上滑 500 像素
+      to           滑到绝对客户区坐标：to=[400, 300]
+      path         一串途经点：[[100,100],[300,300],[500,200]]
+      pattern      手势名：line / up / down / left / right / circle / square / zigzag
+                   （up/down 这类就是「方向 + 一段固定距离」的语法糖，也可以再配 distance）
+
+    返回 (点序列, 回显用的元信息)。
+    """
+    cw, ch = window_dimensions(hwnd, client_only=True)
+    x0, y0 = start
+
+    def clamp(p: tuple[int, int]) -> tuple[int, int]:
+        return max(0, min(int(p[0]), cw - 1)), max(0, min(int(p[1]), ch - 1))
+
+    distance = int(body.get("distance", 300))
+    if not (1 <= distance <= 20000):
+        raise AppError("distance 必须在 1~20000 像素之间", code=2)
+
+    if body.get("path") is not None:
+        raw = body["path"]
+        if not isinstance(raw, list) or not raw:
+            raise AppError("path 必须是坐标数组，如 [[100,100],[300,300]]", code=2)
+        if len(raw) > 128:
+            raise AppError("path 最多 128 个点", code=2)
+        pts = []
+        for item in raw:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise AppError(f"path 里的点必须是 [x, y]，收到 {item!r}", code=2)
+            try:
+                pts.append(clamp((int(item[0]), int(item[1]))))
+            except (TypeError, ValueError):
+                raise AppError(f"path 里的坐标必须是整数，收到 {item!r}", code=2)
+        return pts, {"mode": "path", "points": len(pts)}
+
+    if body.get("to") is not None:
+        to = body["to"]
+        if not isinstance(to, (list, tuple)) or len(to) != 2:
+            raise AppError("to 必须是 [x, y]", code=2)
+        try:
+            dest = clamp((int(to[0]), int(to[1])))
+        except (TypeError, ValueError):
+            raise AppError(f"to 的坐标必须是整数，收到 {to!r}", code=2)
+        steps = _clamp_int(body.get("steps"), 1, 5000, "steps", 30)
+        return plan_path(x0, y0, dest[0], dest[1], steps,
+                         ease=bool(body.get("ease"))), {"mode": "to", "to": list(dest)}
+
+    pattern = body.get("pattern")
+    if pattern:
+        name = str(pattern).strip().lower()
+        cx, cy = x0, y0
+        pts: list[tuple[int, int]] = []
+        if name in ("line", "up", "down", "left", "right"):
+            vec = {"up": (0, -distance), "down": (0, distance),
+                   "left": (-distance, 0), "right": (distance, 0),
+                   "line": (0, -distance)}[name]
+            if name == "line":      # line 用 dx/dy；没给就默认向上
+                vec = (int(body.get("dx", 0)), int(body.get("dy", -distance)))
+            steps = _clamp_int(body.get("steps"), 1, 5000, "steps", 30)
+            dest = clamp((cx + vec[0], cy + vec[1]))
+            pts = plan_path(cx, cy, dest[0], dest[1], steps, ease=bool(body.get("ease")))
+        elif name in ("circle", "square", "zigzag"):
+            points = _clamp_int(body.get("points"), 3, 720, "points",
+                                72 if name == "circle" else (4 if name == "square" else 8))
+            r = max(4, distance // 2)
+            if name == "circle":
+                import math
+                for i in range(1, points + 1):
+                    a = 2 * math.pi * i / points
+                    pts.append(clamp((cx + r * math.cos(a), cy + r * math.sin(a))))
+            elif name == "square":
+                d = distance
+                corners = [(cx + d, cy), (cx + d, cy + d), (cx, cy + d), (cx, cy)]
+                for i in range(1, points + 1):
+                    t = i / points * 4
+                    seg = min(int(t), 3)
+                    f = t - seg
+                    a, b = corners[seg], corners[(seg + 1) % 4]
+                    pts.append(clamp((a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f)))
+            else:  # zigzag：左右来回扫，像刷列表
+                seg = max(2, points // 2)
+                for i in range(1, points + 1):
+                    t = i / points
+                    px = cx + (distance if i % 2 else -distance) * t
+                    py = cy - distance * t
+                    pts.append(clamp((px, py)))
+        else:
+            raise AppError(
+                f"不认识的 pattern {pattern!r}。可用：line / up / down / left / right / "
+                f"circle / square / zigzag", code=2)
+        # 手势类默认回到起点：圆/方/锯齿在拖动场景下会把内容拖偏，
+        # 走完一圈回到原处更安全（to_start=false 可以关掉）
+        if name in ("circle", "square", "zigzag") and body.get("to_start", True):
+            pts.append((x0, y0))
+        return pts, {"mode": "pattern", "pattern": name, "points": len(pts)}
+
+    # 默认：相对滑动
+    dx = body.get("dx")
+    dy = body.get("dy")
+    if dx is None and dy is None:
+        raise AppError("得给一种滑动：dx/dy、to、path 或 pattern", code=2)
+    try:
+        dx = int(dx or 0)
+        dy = int(dy or 0)
+    except (TypeError, ValueError):
+        raise AppError("dx / dy 必须是整数", code=2)
+    if dx == 0 and dy == 0:
+        raise AppError("dx 和 dy 都是 0，滑动没有意义", code=2)
+    steps = _clamp_int(body.get("steps"), 1, 5000, "steps", 30)
+    dest = clamp((x0 + dx, y0 + dy))
+    if dest != (x0 + dx, y0 + dy):
+        dx, dy = dest[0] - x0, dest[1] - y0
+    return plan_path(x0, y0, dest[0], dest[1], steps,
+                     ease=bool(body.get("ease"))), {"mode": "delta", "dx": dx, "dy": dy}
+
+
+def mouse_scroll(hwnd: int, x: int, y: int, amount: int, axis: str = "vertical",
+                 method: str = "post", delay: float = 0.03) -> dict:
+    """
+    滚轮。amount 单位是「格」，正数 = 向上 / 向左，负数 = 向下 / 向右。
+
+    竖滚发 WM_MOUSEWHEEL，横滚发 WM_MOUSEHWHEEL —— 横滚不是所有控件都支持，
+    不支持的就完全没反应（不会报错，别以为是代码坏了）。
+
+    ★ 滚轮的 wParam 里**高 16 位**是增量、低 16 位是按键状态，
+      和别的鼠标消息正好相反，很容易写反。lParam 用的是**屏幕坐标**，
+      不是客户区坐标（这也是滚轮消息和点击消息的区别之一）。
+    """
+    if axis not in ("vertical", "horizontal"):
+        raise AppError("axis 只能是 vertical / horizontal", code=2)
+    if not isinstance(amount, int) or amount == 0:
+        raise AppError("amount 必须是非 0 整数（正数向上/向左，负数向下/向右）", code=2)
+    if abs(amount) > 1000:
+        raise AppError("amount 绝对值上限 1000", code=2)
+
+    msg = 0x020A if axis == "vertical" else 0x020E
+    sx, sy = resolve_screen_point(hwnd, x, y)
+    lp = make_lparam(sx, sy)              # ★ 屏幕坐标
+    events: list[dict] = []
+    sent = failed = 0
+
+    for _ in range(abs(amount)):
+        delta = WHEEL_DELTA if amount > 0 else -WHEEL_DELTA
+        if axis == "horizontal":
+            delta = -delta                # 横滚方向相反：正 = 向左
+        wp = ((delta & 0xFFFF) << 16) | 0  # 高 16 位增量，低 16 位按键状态
+        ok, err = _dispatch_key_msg(hwnd, msg, wp, lp, method)
+        events.append({"msg": hex(msg), "delta": delta, "ok": ok, "error": err})
+        if ok:
+            sent += 1
+        else:
+            failed += 1
+            break
+        time.sleep(max(0.0, delay))
+
+    return {"ok": failed == 0 and sent > 0, "mode": "scroll", "axis": axis,
+            "amount": amount, "sent": sent, "failed": failed,
+            "screen_point": [sx, sy], "events": events[-20:]}
+
+
+def mouse_drag(hwnd: int, points: list[tuple[int, int]], button: str = "left",
+               method: str = "post", hold: float = 0.03, delay: float = 0.015,
+               release: bool = True, deep: bool = True) -> dict:
+    """
+    按住一个键沿 points 走完全程。points[0] 是起点。
+
+    ★ 拖动期间每条 WM_MOUSEMOVE 都带 MK_xxx（按键状态位）——
+      不带就等于中途松手，拖动会断在起点，这是最经典的坑。
+
+    投递顺序：
+      移动到起点 → 按下 → 逐点移动（带 MK）→ 抬起
+    deep=True 时和点击一样会逐层钻到最深的子控件。
+    """
+    if len(points) < 2:
+        raise AppError("拖动至少要有起点和终点两个点", code=2)
+    if button not in BUTTONS:
+        raise AppError(f"button 只能是 {list(BUTTONS)}，收到 {button!r}", code=2)
+    if method not in ("post", "send"):
+        raise AppError("拖动只支持 post / send（hardware 真拖拽请用 bgclick.py CLI）", code=2)
+
+    down, up, mk = BUTTONS[button]
+    events: list[dict] = []
+    sent = failed = 0
+    # 先决定发给谁：默认钻到最深的子控件（标准控件都是子窗口，发给顶层等于石沉大海）。
+    # ★ 只钻一次，起点定了就不再改 —— 拖动途中重新钻取会换成别的控件，把拖拽打断。
+    send_to = hwnd
+    if deep:
+        send_to, _, _, _ = deepest_child_at(hwnd, points[0][0], points[0][1])
+
+    def emit(msg: int, wp: int, lp: int, tag: str) -> bool:
+        nonlocal sent, failed
+        ok, err = _dispatch_key_msg(send_to, msg, wp, lp, method)
+        events.append({"msg": hex(msg), "wparam": hex(wp), "lparam": hex(lp),
+                       "ok": ok, "error": err, "tag": tag, "target": hex(send_to)})
+        if ok:
+            sent += 1
+            return True
+        failed += 1
+        return False
+
+    if not emit(WM_MOUSEMOVE, 0, make_lparam(*points[0]), "move-to-start"):
+        return {"ok": False, "mode": "drag", "error": events[-1]["error"],
+                "sent": sent, "failed": failed, "events": events[-20:]}
+    time.sleep(max(0.0, hold))
+    if not emit(down, mk, make_lparam(*points[0]), "down"):
+        return {"ok": False, "mode": "drag", "error": events[-1]["error"],
+                "sent": sent, "failed": failed, "events": events[-20:]}
+
+    time.sleep(max(0.0, hold))
+    for i, (px, py) in enumerate(points[1:], 1):
+        # 每步都带到**同一个**目标窗口的客户区坐标（不重新钻取，
+        # 拖动途中钻取会换来换去，反而把拖拽打断）
+        if not emit(WM_MOUSEMOVE, mk, make_lparam(px, py), f"move-{i}"):
+            break
+        time.sleep(max(0.0, delay))
+
+    time.sleep(max(0.0, hold))
+    if release:
+        last = points[-1]
+        emit(up, 0, make_lparam(*last), "up")
+
+    return {"ok": failed == 0 and sent > 1, "mode": "drag", "button": button,
+            "from": list(points[0]), "to": list(points[-1]),
+            "steps": len(points) - 1, "release": release,
+            "sent": sent, "failed": failed, "events": events[-20:]}
+
+
+def do_mouse(args, body: dict) -> dict:
+    """
+    鼠标滑动/拖拽/滚轮的统一入口（服务端和 CLI 共用）。
+
+    body 里可以带：
+      from / start        起点客户区坐标（默认客户区中心）
+      dx / dy             相对滑动
+      to                  绝对终点
+      path                途经点
+      pattern             手势
+      steps               插值步数（默认 30）
+      ease                平滑加减速
+      duration            总时长秒 —— 给了就按它反推每步间隔（优先级高于 delay）
+      delay               每步间隔秒（默认 0.02）
+      button              拖拽时按哪个键（默认 left）；给了 button/hold 就走拖拽
+      hold                按下与抬起前的额外停顿（秒）
+      release             结束时是否抬起（默认 true）
+      scroll              滚轮格数（正数向上，负数向下）
+      axis                vertical / horizontal
+      method              post / send
+      no_deep             不钻取子控件
+
+    ★ method 只允许 post / send。真拖拽（SetCursorPos + mouse_event）
+      会抢占用户的真实光标，属于前台行为，不在本接口里做 —— 需要就用 CLI。
+    """
+    method = body.get("method", "post")
+    if method not in ("post", "send"):
+        raise AppError("滑动只支持 post / send（真拖拽请用 bgclick.py CLI）", code=2)
+
+    hwnd = args.hwnd_int
+    cw, ch = window_dimensions(hwnd, client_only=True)
+    start_raw = body.get("from", body.get("start"))
+    if start_raw is None:
+        start = (cw // 2, ch // 2)
+    else:
+        if not isinstance(start_raw, (list, tuple)) or len(start_raw) != 2:
+            raise AppError("from 必须是 [x, y]", code=2)
+        try:
+            start = (int(start_raw[0]), int(start_raw[1]))
+        except (TypeError, ValueError):
+            raise AppError(f"from 的坐标必须是整数，收到 {start_raw!r}", code=2)
+    if not (0 <= start[0] < cw and 0 <= start[1] < ch):
+        raise AppError(f"起点 {start} 落在客户区 {cw}x{ch} 之外", code=2)
+
+    delay = float(body.get("delay", 0.02))
+    if not (0 <= delay <= 60):
+        raise AppError("delay 必须在 0~60 秒之间", code=2)
+
+    # --- 滚轮 ---
+    if body.get("scroll") is not None:
+        axis = str(body.get("axis", "vertical")).lower()
+        try:
+            amount = int(body["scroll"])
+        except (TypeError, ValueError):
+            raise AppError("scroll 必须是整数", code=2)
+        rec = mouse_scroll(hwnd, start[0], start[1], amount, axis=axis,
+                           method=method, delay=max(delay, 0.01))
+        rec.update({"from": list(start), "hwnd": hex(hwnd)})
+        return rec
+
+    # --- 滑动路径 ---
+    pts, meta = _path_from_spec(hwnd, start, body)
+    if not pts:
+        raise AppError("路径是空的，没什么可滑", code=2)
+
+    duration = body.get("duration")
+    if duration is not None:
+        try:
+            duration = float(duration)
+        except (TypeError, ValueError):
+            raise AppError("duration 必须是数字（秒）", code=2)
+        if not (0 <= duration <= 3600):
+            raise AppError("duration 必须在 0~3600 秒之间", code=2)
+        delay = duration / max(1, len(pts))
+
+    hold = float(body.get("hold", 0.03))
+    if not (0 <= hold <= 60):
+        raise AppError("hold 必须在 0~60 秒之间", code=2)
+
+    button = body.get("button")
+    is_drag = bool(button) or bool(body.get("drag"))
+
+    if is_drag:
+        rec = mouse_drag(hwnd, [start] + pts, button=button or "left", method=method,
+                         hold=hold, delay=delay, release=bool(body.get("release", True)),
+                         deep=not bool(body.get("no_deep")))
+        rec["mode"] = "drag"
+    else:
+        rec = mouse_swipe(hwnd, pts, method=method, delay=delay,
+                          deep=not bool(body.get("no_deep")))
+
+    input_mode = meta.pop("mode", None)
+    rec.update(meta)
+    rec["input_mode"] = input_mode       # delta / to / path / pattern
+    rec["from"] = list(start)
+    rec["to"] = list(pts[-1])
+    rec["steps"] = len(pts)
+    rec["ease"] = bool(body.get("ease"))
+    rec["hwnd"] = hex(hwnd)
+    return rec
+
+
+def mouse_swipe(hwnd: int, points: list[tuple[int, int]], method: str = "post",
+                delay: float = 0.02, deep: bool = True) -> dict:
+    """
+    不按键的移动：鼠标从当前位置一路「划过」points（悬停滑动）。
+    可以触发 hover 高亮、tooltip、画布上的 hover 手势。
+
+    ★ 悬停滑动只发 WM_MOUSEMOVE，wParam=0（没有按键按下）。
+      如果目标只认真的光标位置（比如游戏、DirectX），这条通路无效，
+      那属于「合成消息天生无效」的情况，得用真移动。
+    """
+    events: list[dict] = []
+    sent = failed = 0
+    dest = hwnd
+    if deep and points:
+        dest, _, _, _ = deepest_child_at(hwnd, points[0][0], points[0][1])
+
+    for i, (px, py) in enumerate(points):
+        lp = make_lparam(px, py)
+        if method == "send":
+            out = ctypes.c_size_t(0)
+            ctypes.set_last_error(0)
+            res = user32.SendMessageTimeoutW(dest, WM_MOUSEMOVE, 0, lp,
+                                             SMTO_ABORTIFHUNG | SMTO_BLOCK, 1000,
+                                             ctypes.byref(out))
+            err = ctypes.get_last_error()
+            ok, err = (not (res == 0 and err)), (err if res == 0 else 0)
+        else:
+            ok, err = post_checked(dest, WM_MOUSEMOVE, 0, lp)
+        events.append({"msg": hex(WM_MOUSEMOVE), "point": [px, py],
+                       "wparam": "0x0", "lparam": hex(lp), "ok": ok, "error": err})
+        if ok:
+            sent += 1
+        else:
+            failed += 1
+            break
+        if i < len(points) - 1:
+            time.sleep(max(0.0, delay))
+
+    return {"ok": failed == 0 and sent > 0, "mode": "swipe", "sent": sent,
+            "failed": failed, "events": events[-20:]}
 
 
 # --------------------------------------------------------------------------
@@ -1695,6 +2167,39 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="只打印坐标，不发消息")
     p.add_argument("--json", action="store_true", help="JSON 输出")
     p.add_argument("--keep-open", action="store_true", help="结束时等回车")
+
+    # ---- 滑动 / 拖拽 / 滚轮（不加 --swipe 时这些参数不生效）----
+    p.add_argument("--swipe", action="store_true",
+                   help="滑动手势模式：用 --dx/--dy 或 --to / --path / --pattern 指定轨迹")
+    p.add_argument("--from", dest="from_pos", type=parse_pair,
+                   help="滑动起点客户区坐标 X,Y（默认客户区中心）")
+    p.add_argument("--dx", type=int, default=0, help="水平位移（正数向右）")
+    p.add_argument("--dy", type=int, default=0, help="垂直位移（正数向下，负数向上）")
+    p.add_argument("--to", dest="to_pos", type=parse_pair, help="滑到绝对客户区坐标 X,Y")
+    p.add_argument("--path", help='途经点，形如 "100,100;300,300;500,200"')
+    p.add_argument("--pattern", choices=["line", "up", "down", "left", "right",
+                                         "circle", "square", "zigzag"],
+                   help="手势轨迹（圆/方/锯齿默认会绕回起点，可用 --no-to-start 关掉）")
+    p.add_argument("--distance", type=int, default=300, help="手势轨迹的尺度（像素，默认 300）")
+    p.add_argument("--points", type=int, default=None, help="手势采样点数（圆默认 72）")
+    p.add_argument("--steps", type=int, default=30, help="插值步数（默认 30，越多越平滑）")
+    p.add_argument("--duration", type=float, default=None,
+                   help="整段滑动的总时长秒（给了就按它反推每步间隔）")
+    p.add_argument("--delay", type=float, default=0.02, help="每步间隔秒（默认 0.02）")
+    p.add_argument("--hold", type=float, default=0.03, help="按下/抬起前的停顿秒（拖拽用）")
+    p.add_argument("--ease", action="store_true", help="平滑加减速（起步慢收尾慢，更像人手）")
+    p.add_argument("--drag", action="store_true", help="按住并拖动（配合 --dx/--dy/--to/--path）")
+    p.add_argument("--release", action="store_true", default=True, help="结束时抬起（默认就是抬）")
+    p.add_argument("--no-release", dest="release", action="store_false",
+                   help="结束时不抬键（留一个按住状态，慎用）")
+    p.add_argument("--no-to-start", dest="to_start", action="store_false", default=True,
+                   help="手势走完不回到起点")
+    p.add_argument("--no-deep", dest="deep", action="store_false", default=True,
+                   help="不钻取子控件，直接发给顶层窗口")
+    p.add_argument("--scroll", type=int, default=None,
+                   help="滚轮格数（正数向上/向左，负数向下/向右）")
+    p.add_argument("--axis", default="vertical", choices=["vertical", "horizontal"],
+                   help="滚轮方向轴")
     return p
 
 
@@ -2157,6 +2662,96 @@ def cmd_click(args) -> int:
     return 0 if failed == 0 else 5
 
 
+def cmd_swipe(args) -> int:
+    """
+    CLI 入口：滑动 / 拖拽 / 滚轮。
+
+    参数都走消息投递，不动真实光标；一次最多发 5000 步。
+    """
+    if args.method == "hardware":
+        raise AppError(
+            "滑动/拖拽只支持 post / send。真拖拽要抢占真实光标，"
+            "属于前台行为，本工具不做 —— 需要就自己写 SetCursorPos + mouse_event。", code=2)
+
+    cands = match_windows(args)
+    if not cands:
+        raise AppError("没找到匹配的窗口。跑一下 --list 看看？", code=1)
+    if args.index >= len(cands) or args.index < 0:
+        msg = [f"匹配到 {len(cands)} 个窗口，--index {args.index} 越界"]
+        msg += [f"  [{i}] {c['hwnd_hex']} {c['process']} | {c['title']}"
+                for i, c in enumerate(cands)]
+        raise AppError("\n".join(msg))
+
+    target = cands[args.index]
+    body: dict = {"method": args.method, "delay": args.delay, "hold": args.hold,
+                  "ease": args.ease, "no_deep": not args.deep,
+                  "release": args.release, "steps": args.steps}
+    if args.from_pos:
+        body["from"] = list(args.from_pos)
+    if args.duration is not None:
+        body["duration"] = args.duration
+    if args.scroll is not None:
+        body["scroll"] = args.scroll
+        body["axis"] = args.axis
+    else:
+        if args.pattern:
+            body["pattern"] = args.pattern
+            body["distance"] = args.distance
+        elif args.path:
+            pts = []
+            for chunk in args.path.replace("，", ",").split(";"):
+                chunk = chunk.strip()
+                if not chunk:
+                    continue
+                try:
+                    a, b = chunk.split(",")
+                    pts.append([int(a.strip(), 0), int(b.strip(), 0)])
+                except Exception:
+                    raise AppError(f"--path 格式应为 \"x,y;x,y\"，收到 {chunk!r}", code=2)
+            body["path"] = pts
+        elif args.to_pos:
+            body["to"] = list(args.to_pos)
+        else:
+            body["dx"], body["dy"] = args.dx, args.dy
+        if args.drag:
+            body["button"] = args.button
+        elif args.button != "left":
+            body["button"] = args.button
+
+    if not args.json:
+        kind = ("滚轮" if args.scroll is not None
+                else ("拖拽" if body.get("button") else "悬停滑动"))
+        print(f"本进程权限：{'管理员' if is_admin() else '普通用户'}")
+        print(f"目标：{target['hwnd_hex']}  {target['process']}  「{target['title'][:40]}」")
+        print(f"{kind} / 方式 {args.method} / 步数 {args.steps}"
+              + ("（平滑加减速）" if args.ease else ""))
+
+    fake = argparse.Namespace(hwnd_int=target["hwnd"])
+    rec = do_mouse(fake, body)
+    rec.update({"hwnd": target["hwnd_hex"], "title": target["title"],
+                "process": target["process"]})
+
+    if args.json:
+        print(json.dumps(rec, ensure_ascii=False))
+    else:
+        if rec.get("ok"):
+            if rec.get("mode") == "scroll":
+                print(f"已滚 {rec['amount']} 格（{rec['axis']}），"
+                      f"投递 {rec['sent']} 条消息，落在客户区 {rec.get('from')}")
+            else:
+                print(f"{'拖拽' if rec.get('button') else '滑动'}完成："
+                      f"{rec.get('from')} → {rec.get('to')}，"
+                      f"共 {rec.get('steps')} 步 / 投递 {rec.get('sent')} 条消息")
+        else:
+            err = rec.get("error", 0)
+            print(f"投递失败：{describe_error(err)}", file=sys.stderr)
+            if err == ERROR_ACCESS_DENIED:
+                print(">>> UIPI 拦截：目标完整性级别比本进程高。加 --elevate 重跑。",
+                      file=sys.stderr)
+            return 4 if err == ERROR_ACCESS_DENIED else 5
+    return 0 if rec.get("ok") else 5
+
+
 def maybe_auto_elevate(args, hwnd: int, reason: str) -> Optional[int]:
     """
     需要时自动提权重跑。返回退出码（表示"已经处理完了，别继续"）或 None（继续跑）。
@@ -2318,6 +2913,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             code = cmd_doctor(args)
         elif args.shot:
             code = cmd_shot(args)
+        elif args.swipe or args.scroll is not None:
+            code = cmd_swipe(args)
         elif (not argv and args.hwnd is None and not args.title and not args.process
               and not (args.pos or args.center or args.screen_pos)):
             code = interactive_guide()      # 双击/无参数 → 给引导
