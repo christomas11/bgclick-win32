@@ -66,6 +66,12 @@ bgserver.py —— 后台点击/截图的常驻本地服务（供 agent skill �
   7. /mouse 接口 —— 鼠标滑动 / 拖拽 / 滚轮。相对位移、绝对坐标、途经点、手势，
      以及按住拖动（每步带按键状态位，否则程序会认为中途松手）。
      坐标是客户区坐标；滚轮的 lParam 用屏幕坐标（Windows 规定）。
+
+1.2.1 修复：
+  8. /key 的 text 模式不再对同一个字符同时发 WM_KEYDOWN 和 WM_CHAR。
+     两条通道都被控件吃下时字符会翻倍（记事本里 "Hello!" → "Hheelllloo!1"），
+     而且按键通道翻译出的是小写（真实键盘没按着 Shift）。
+     默认改成每个字符只走一条通道，另提供 "mode": "keys" / "both"。
 """
 
 from __future__ import annotations
@@ -91,7 +97,7 @@ from urllib.parse import urlparse, parse_qs
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bgclick as bc  # noqa: E402
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 DEFAULT_PORT = 8765
 
 # 允许截图落盘的根目录（启动时填充为绝对路径）
@@ -602,8 +608,12 @@ class Handler(BaseHTTPRequestHandler):
                不给 hold_seconds 就是一次普通的组合键（等于模式 1）。
                松开顺序自动倒过来（先放主键，再放修饰键），和真人一致。
 
-          3. text —— 逐字符「真按键」输入，每个字符拆成 修饰键+主键 再补 WM_CHAR。
-                 当前键盘布局打不出的字符（中文、emoji）自动退回纯 WM_CHAR。
+          3. text —— 逐字符输入。默认 auto：每个字符**只走一条通道** ——
+                 需要 Shift/Ctrl/Alt 的走 WM_KEYDOWN/UP，不需要的直接发 WM_CHAR。
+                 当前键盘布局打不出的字符（中文、emoji）只能走 WM_CHAR。
+                 ★ 可选 "mode": "keys"（全走按键消息，给 IDE/游戏/画布）
+                   或 "mode": "both"（两条通道都发 —— 老行为，在记事本这类
+                   同时认两条通道的控件里字符会翻倍，只在目标确实不认某一条时用）。
 
         ★ 发给谁：和 /text 一样，优先发给目标窗口所在线程的焦点控件
           （GetGUIThreadInfo），拿不到才退回顶层窗口。键盘消息必须命中焦点控件，
@@ -713,11 +723,14 @@ class Handler(BaseHTTPRequestHandler):
             result["mode"] = "keys"
             result["specs"] = list(keys)
 
-        # --- 模式 3：逐字符真按键 ---
+        # --- 模式 3：逐字符输入 ---
         else:
             if len(text) > 4096:
                 raise bc.AppError("text 过长（上限 4096 字符）", code=2)
-            result = bc.send_text_as_keys(dest, text, method=method,
+            mode = str(body.get("mode", "auto")).lower()
+            if mode not in ("auto", "keys", "both"):
+                raise bc.AppError("mode 只能是 auto / keys / both", code=2)
+            result = bc.send_text_as_keys(dest, text, method=method, mode=mode,
                                           hold=hold_gap, interval=max(0.005, interval))
             result["mode"] = "text"
             result["specs"] = [text[:64]]

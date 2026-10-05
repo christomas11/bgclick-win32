@@ -461,6 +461,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="不补 WM_CHAR，只发按键消息")
     sp.add_argument("--with-char", dest="char", action="store_true", default=None,
                     help="强制补 WM_CHAR（Ctrl/Alt 组合默认是不补的）")
+    sp.add_argument("--as-keys", dest="text_mode", action="store_const", const="keys",
+                    help="--type 时全部走按键消息，不发 WM_CHAR（给 IDE/游戏/画布）")
+    sp.add_argument("--as-both", dest="text_mode", action="store_const", const="both",
+                    help="--type 时两条通道都发（老行为，记事本这类控件会字符翻倍）")
 
     sp = add("mouse", "鼠标滑动 / 拖拽 / 滚轮（走消息投递，不动真实光标）")
     add_target_args(sp)
@@ -616,6 +620,8 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 body["text"] = args.typed
                 body["interval"] = 0.01 if args.interval == 0.06 else args.interval
+                if args.text_mode:
+                    body["mode"] = args.text_mode
             r = client.key(**body)
             if r.get("ok"):
                 k = r.get("key", {})
