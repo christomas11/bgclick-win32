@@ -72,6 +72,12 @@ bgserver.py —— 后台点击/截图的常驻本地服务（供 agent skill �
      两条通道都被控件吃下时字符会翻倍（记事本里 "Hello!" → "Hheelllloo!1"），
      而且按键通道翻译出的是小写（真实键盘没按着 Shift）。
      默认改成每个字符只走一条通道，另提供 "mode": "keys" / "both"。
+
+1.3.0 新增：
+  9. /mouse 支持 method="hardware" 真输入（SetCursorPos + mouse_event）：
+     真移动光标、真按下、真滚轮。给「合成消息当没发生」的程序用 ——
+     鼠标位置是全局状态，程序会去查真实光标，消息伪造不了状态，
+     所以这类程序的滑动/拖拽只有真输入一条路。代价是占用真实光标（前台行为）。
 """
 
 from __future__ import annotations
@@ -97,7 +103,7 @@ from urllib.parse import urlparse, parse_qs
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bgclick as bc  # noqa: E402
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 DEFAULT_PORT = 8765
 
 # 允许截图落盘的根目录（启动时填充为绝对路径）
@@ -768,7 +774,11 @@ class Handler(BaseHTTPRequestHandler):
 
         ★ 坐标是客户区坐标；滚轮的 lParam 按 Windows 规定用屏幕坐标，库内部换算。
 
-        ★ 只支持 post / send。真拖拽要抢占用户的真实光标，是前台行为，本接口不做。
+        ★ 只允许 post / send / hardware：
+          post/send 走消息投递，不动真实光标；
+          **hardware 是真输入**（SetCursorPos + mouse_event），会占用用户的真实光标，
+          但「合成消息无效」的程序（浏览器/Electron、游戏、自绘 UI）只有这一条路 ——
+          因为鼠标位置是全局状态，程序会查真实光标，消息伪造不了状态。
         """
         target = find_target(body)
         args = argparse.Namespace(hwnd_int=target["hwnd"])

@@ -492,8 +492,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--ease", action="store_true", help="平滑加减速，更像人手")
     sp.add_argument("--no-release", dest="release", action="store_false", default=True,
                     help="拖完不抬键（慎用）")
-    sp.add_argument("--method", default="post", choices=["post", "send"],
-                    help="投递方式（默认 post 纯后台）")
+    sp.add_argument("--method", default="post", choices=["post", "send", "hardware"],
+                    help="投递方式：post 纯后台（默认）/ send 同步 / "
+                         "hardware 真输入（会占用真实光标，但合成消息无效的程序只吃这个）")
+    sp.add_argument("--no-restore-cursor", dest="restore_cursor", action="store_false",
+                    default=True, help="hardware 模式结束后不把光标放回原处")
 
     return p
 
@@ -634,7 +637,8 @@ def main(argv: list[str] | None = None) -> int:
             body = target_payload(args)
             body.update({"method": args.method, "steps": args.steps, "hold": args.hold,
                          "ease": args.ease, "distance": args.distance,
-                         "release": args.release})
+                         "release": args.release,
+                         "restore_cursor": args.restore_cursor})
             if args.delay != 0.02:
                 body["delay"] = args.delay
             if args.from_pos:

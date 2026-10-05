@@ -1170,15 +1170,18 @@ def do_mouse(args, body: dict) -> dict:
       release             结束时是否抬起（默认 true）
       scroll              滚轮格数（正数向上，负数向下）
       axis                vertical / horizontal
-      method              post / send
+      method              post / send / hardware（真输入，会动真实光标）
       no_deep             不钻取子控件
 
-    ★ method 只允许 post / send。真拖拽（SetCursorPos + mouse_event）
-      会抢占用户的真实光标，属于前台行为，不在本接口里做 —— 需要就用 CLI。
+    ★ method=hardware 是「合成消息无效」时的唯一出路：
+      真移动光标 + 真按键事件，走系统输入队列，所有程序都吃。
+      代价是会占用用户的真实光标（前台行为），所以不主动用、必须显式指定。
+      真拖拽时**不会**自动把目标调到前台 —— 挪光标本身就是抢焦点行为，
+      但目标窗口得是可见且没被完全遮住的，否则拖的是别的窗口。
     """
     method = body.get("method", "post")
-    if method not in ("post", "send"):
-        raise AppError("滑动只支持 post / send（真拖拽请用 bgclick.py CLI）", code=2)
+    if method not in ("post", "send", "hardware"):
+        raise AppError("method 只能是 post / send / hardware", code=2)
 
     hwnd = args.hwnd_int
     cw, ch = window_dimensions(hwnd, client_only=True)
@@ -1206,8 +1209,12 @@ def do_mouse(args, body: dict) -> dict:
             amount = int(body["scroll"])
         except (TypeError, ValueError):
             raise AppError("scroll 必须是整数", code=2)
-        rec = mouse_scroll(hwnd, start[0], start[1], amount, axis=axis,
-                           method=method, delay=max(delay, 0.01))
+        if method == "hardware":
+            rec = mouse_scroll_hardware(hwnd, start[0], start[1], amount, axis=axis,
+                                        restore_cursor=bool(body.get("restore_cursor", True)))
+        else:
+            rec = mouse_scroll(hwnd, start[0], start[1], amount, axis=axis,
+                               method=method, delay=max(delay, 0.01))
         rec.update({"from": list(start), "hwnd": hex(hwnd)})
         return rec
 
@@ -1233,7 +1240,14 @@ def do_mouse(args, body: dict) -> dict:
     button = body.get("button")
     is_drag = bool(button) or bool(body.get("drag"))
 
-    if is_drag:
+    if method == "hardware":
+        # 真输入：真移动光标，所有程序都吃（代价是占用真实光标）
+        rec = mouse_swipe_hardware(hwnd, [start] + pts,
+                                   button=(button or "left") if is_drag else None,
+                                   restore_cursor=bool(body.get("restore_cursor", True)),
+                                   step_delay=delay)
+        rec["mode"] = "hardware-drag" if is_drag else "hardware-swipe"
+    elif is_drag:
         rec = mouse_drag(hwnd, [start] + pts, button=button or "left", method=method,
                          hold=hold, delay=delay, release=bool(body.get("release", True)),
                          deep=not bool(body.get("no_deep")))
@@ -1251,6 +1265,126 @@ def do_mouse(args, body: dict) -> dict:
     rec["ease"] = bool(body.get("ease"))
     rec["hwnd"] = hex(hwnd)
     return rec
+
+
+def mouse_swipe_hardware(hwnd: int, points: list[tuple[int, int]], button: Optional[str] = None,
+                         restore_cursor: bool = True, step_delay: float = 0.012) -> dict:
+    """
+    ★ 真输入版本：SetCursorPos + mouse_event 走真实的鼠标事件队列。
+
+    为什么必须要有这个：
+      合成的 WM_MOUSEMOVE 对**大量程序无效**，而且不是 bug、是设计 ——
+      Windows 里鼠标位置是**全局状态**，程序随时可以调 GetCursorPos 查真实位置。
+      很多现代程序（浏览器/Electron、游戏、自绘 UI）收到 WM_MOUSEMOVE 之后
+      会去核对真实光标位置，发现没动就当这条消息不存在。
+      点击为什么常常还行？因为「按下」是一个**事件**，程序认这条消息；
+      而「移动」是**状态**，状态没法用消息伪造。
+
+      所以：滑动/拖拽在合成消息无效的程序里，只有真输入这一条路。
+
+    代价（必须说清楚）：
+      * 会**真的移动用户的物理光标**，属于前台行为，会打扰正在操作的人；
+      * 目标是「光标底下那个窗口」，不一定是原来那个 hwnd —— 所以调用方
+        应该先把目标窗口调到前台（restore=False 时不自动做）。
+      * restore_cursor=True 时结束时把光标放回原处（仅终点，不是全程）。
+
+    button=None  → 纯移动（悬停滑动）
+    button="left"/"right"/"middle" → 按下并保持，走完全程再抬起（真拖拽）
+    """
+    if button is not None and button not in HW_BUTTONS:
+        raise AppError(f"真输入拖拽的 button 只能是 {list(HW_BUTTONS)}，收到 {button!r}", code=2)
+
+    cw, ch = window_dimensions(hwnd, client_only=True)
+    saved = wintypes.POINT()
+    had_saved = bool(user32.GetCursorPos(ctypes.byref(saved)))
+
+    events: list[dict] = []
+    moved = 0
+    failed = 0
+
+    down_up = HW_BUTTONS.get(button) if button else None
+
+    # 先落到起点，再按（按住拖拽时顺序不能反）
+    first_sx, first_sy = resolve_screen_point(hwnd, points[0][0], points[0][1])
+    if not user32.SetCursorPos(first_sx, first_sy):
+        return {"ok": False, "mode": "hardware-drag" if button else "hardware-swipe",
+                "error": ctypes.get_last_error() or ERROR_ACCESS_DENIED,
+                "detail": f"SetCursorPos 到 ({first_sx},{first_sy}) 失败，取消以免误操作",
+                "sent": 0, "failed": 1, "events": []}
+    events.append({"action": "move", "screen_point": [first_sx, first_sy]})
+    time.sleep(step_delay)
+
+    if down_up:
+        user32.mouse_event(down_up[0], 0, 0, 0, None)
+        events.append({"action": "down", "button": button})
+        time.sleep(0.03)
+
+    for (px, py) in points[1:]:
+        sx, sy = resolve_screen_point(hwnd, px, py)
+        if not user32.SetCursorPos(sx, sy):
+            failed += 1
+            break
+        # 真拖拽时移动消息由系统自己产生，带正确的按键状态位，不用我们伪造
+        events.append({"action": "move", "point": [px, py], "screen_point": [sx, sy]})
+        moved += 1
+        time.sleep(step_delay)
+
+    if down_up:
+        time.sleep(0.03)
+        user32.mouse_event(down_up[1], 0, 0, 0, None)
+        events.append({"action": "up", "button": button})
+
+    restored = False
+    if restore_cursor and had_saved:
+        time.sleep(0.03)
+        restored = bool(user32.SetCursorPos(saved.x, saved.y))
+
+    return {"ok": failed == 0 and (moved > 0 or len(points) == 1),
+            "mode": "hardware-drag" if button else "hardware-swipe",
+            "button": button, "from": list(points[0]), "to": list(points[-1]),
+            "steps": len(points) - 1, "moved": moved, "failed": failed,
+            "cursor_restored": restored, "events": events[-20:]}
+
+
+def mouse_scroll_hardware(hwnd: int, x: int, y: int, amount: int, axis: str = "vertical",
+                          restore_cursor: bool = True) -> dict:
+    """
+    ★ 真滚轮：把光标挪到目标位置上再发 mouse_event 的 WHEEL 事件。
+
+    为什么要挪光标：系统的滚轮事件是发给**光标底下那个窗口**的，
+      不挪过去就会滚错窗口 —— 这是真滚轮和 /mouse 消息投递最大的区别。
+
+    axis="horizontal" 用 MOUSEEVENTF_HWHEEL（也不是所有程序支持横滚）。
+    """
+    MOUSEEVENTF_WHEEL, MOUSEEVENTF_HWHEEL = 0x0800, 0x1000
+    flag = MOUSEEVENTF_WHEEL if axis == "vertical" else MOUSEEVENTF_HWHEEL
+
+    saved = wintypes.POINT()
+    had_saved = bool(user32.GetCursorPos(ctypes.byref(saved)))
+    sx, sy = resolve_screen_point(hwnd, x, y)
+    if not user32.SetCursorPos(sx, sy):
+        return {"ok": False, "mode": "hardware-scroll",
+                "error": ctypes.get_last_error() or ERROR_ACCESS_DENIED,
+                "detail": f"SetCursorPos 到 ({sx},{sy}) 失败", "sent": 0, "failed": 1}
+    time.sleep(0.05)
+
+    sent = failed = 0
+    for _ in range(abs(amount)):
+        delta = WHEEL_DELTA if amount > 0 else -WHEEL_DELTA
+        if axis == "horizontal":
+            delta = -delta
+        # mouse_event 的 dwData 是**有符号**的，负数要当 32 位传
+        user32.mouse_event(flag, 0, 0, ctypes.c_ulong(delta & 0xFFFFFFFF).value, None)
+        sent += 1
+        time.sleep(0.03)
+
+    restored = False
+    if restore_cursor and had_saved:
+        restored = bool(user32.SetCursorPos(saved.x, saved.y))
+
+    return {"ok": failed == 0 and sent > 0, "mode": "hardware-scroll", "axis": axis,
+            "amount": amount, "sent": sent, "failed": failed,
+            "screen_point": [sx, sy], "cursor_restored": restored}
 
 
 def mouse_swipe(hwnd: int, points: list[tuple[int, int]], method: str = "post",
@@ -2197,8 +2331,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="投递方式（默认 post 纯后台）")
     p.add_argument("--no-deep", dest="deep", action="store_false", default=True,
                    help="不向下钻取子窗口，直接发给顶层窗口")
-    p.add_argument("--restore-cursor", action="store_true",
-                   help="hardware 模式下点完把光标放回原处")
+    p.add_argument("--restore-cursor", dest="restore_cursor", action="store_true",
+                   default=True, help="hardware 模式下结束后把光标放回原处（默认就放回）")
+    p.add_argument("--no-restore-cursor", dest="restore_cursor", action="store_false",
+                   help="hardware 模式下不恢复光标（留在原地）")
     p.add_argument("--activate", action="store_true", help="点击前先把窗口调到前台")
     p.add_argument("--elevate", action="store_true",
                    help="立刻申请管理员权限重跑（不等检测，会弹 UAC）")
@@ -2716,12 +2852,10 @@ def cmd_swipe(args) -> int:
     """
     CLI 入口：滑动 / 拖拽 / 滚轮。
 
-    参数都走消息投递，不动真实光标；一次最多发 5000 步。
+    post / send 走消息投递，不动真实光标；
+    hardware 走真输入（SetCursorPos + mouse_event），会占用真实光标但所有程序都吃。
     """
-    if args.method == "hardware":
-        raise AppError(
-            "滑动/拖拽只支持 post / send。真拖拽要抢占真实光标，"
-            "属于前台行为，本工具不做 —— 需要就自己写 SetCursorPos + mouse_event。", code=2)
+    hardware = args.method == "hardware"
 
     cands = match_windows(args)
     if not cands:
@@ -2735,7 +2869,8 @@ def cmd_swipe(args) -> int:
     target = cands[args.index]
     body: dict = {"method": args.method, "delay": args.delay, "hold": args.hold,
                   "ease": args.ease, "no_deep": not args.deep,
-                  "release": args.release, "steps": args.steps}
+                  "release": args.release, "steps": args.steps,
+                  "restore_cursor": bool(getattr(args, "restore_cursor", True))}
     if args.from_pos:
         body["from"] = list(args.from_pos)
     if args.duration is not None:
@@ -2775,6 +2910,11 @@ def cmd_swipe(args) -> int:
         print(f"目标：{target['hwnd_hex']}  {target['process']}  「{target['title'][:40]}」")
         print(f"{kind} / 方式 {args.method} / 步数 {args.steps}"
               + ("（平滑加减速）" if args.ease else ""))
+        if hardware:
+            print("★ hardware 真输入：会占用你的真实光标，期间别动鼠标。"
+                  "若目标被遮挡，拖的是上层窗口。")
+            if not args.restore_cursor:
+                print("★ --no-restore-cursor：结束时不会把光标放回去。")
 
     fake = argparse.Namespace(hwnd_int=target["hwnd"])
     rec = do_mouse(fake, body)
@@ -2788,6 +2928,10 @@ def cmd_swipe(args) -> int:
             if rec.get("mode") == "scroll":
                 print(f"已滚 {rec['amount']} 格（{rec['axis']}），"
                       f"投递 {rec['sent']} 条消息，落在客户区 {rec.get('from')}")
+            elif str(rec.get("mode", "")).startswith("hardware"):
+                print(f"真输入{'拖拽' if 'drag' in rec.get('mode', '') else '滑动'}完成："
+                      f"{rec.get('from')} → {rec.get('to')}，移动 {rec.get('moved')} 步"
+                      + ("，光标已放回原处" if rec.get("cursor_restored") else ""))
             else:
                 print(f"{'拖拽' if rec.get('button') else '滑动'}完成："
                       f"{rec.get('from')} → {rec.get('to')}，"
