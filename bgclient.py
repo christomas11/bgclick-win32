@@ -455,8 +455,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="修饰键与主键之间的间隔秒（默认 0.02）")
     sp.add_argument("--hold-seconds", type=float, default=0.5,
                     help="--hold 的按住时长秒（默认 0.5）")
-    sp.add_argument("--method", default="post", choices=["post", "send"],
-                    help="投递方式（默认 post 纯后台；send 同步等待）")
+    sp.add_argument("--method", default="post", choices=["post", "send", "sendinput"],
+                    help="投递方式：post 默认（后台）/ send 同步 / "
+                         "sendinput 系统输入队列 + 扫描码（只认底层键盘输入的程序吃这个）")
+    sp.add_argument("--no-scancode", dest="scancode", action="store_false", default=True,
+                    help="sendinput 时改用虚拟键码而不是扫描码")
     sp.add_argument("--no-char", dest="char", action="store_false", default=None,
                     help="不补 WM_CHAR，只发按键消息")
     sp.add_argument("--with-char", dest="char", action="store_true", default=None,
@@ -492,11 +495,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--ease", action="store_true", help="平滑加减速，更像人手")
     sp.add_argument("--no-release", dest="release", action="store_false", default=True,
                     help="拖完不抬键（慎用）")
-    sp.add_argument("--method", default="post", choices=["post", "send", "hardware"],
+    sp.add_argument("--method", default="post",
+                    choices=["post", "send", "hardware", "sendinput"],
                     help="投递方式：post 纯后台（默认）/ send 同步 / "
-                         "hardware 真输入（会占用真实光标，但合成消息无效的程序只吃这个）")
+                         "hardware 真输入（SetCursorPos+mouse_event）/ "
+                         "sendinput 系统输入队列（整批原子提交，拖拽最稳）")
+    sp.add_argument("--no-batch", dest="batch", action="store_false", default=True,
+                    help="sendinput 模式下逐点提交而不是整批（轨迹在时间上更像人手）")
     sp.add_argument("--no-restore-cursor", dest="restore_cursor", action="store_false",
-                    default=True, help="hardware 模式结束后不把光标放回原处")
+                    default=True, help="hardware/sendinput 模式结束后不把光标放回原处")
 
     return p
 
@@ -609,7 +616,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "key":
             body = target_payload(args)
             body.update({"repeat": args.repeat, "method": args.method,
-                         "hold_gap": args.hold_gap, "interval": args.interval})
+                         "hold_gap": args.hold_gap, "interval": args.interval,
+                         "scancode": args.scancode})
             if args.char is not None:
                 body["char"] = args.char
             human = None
@@ -637,7 +645,7 @@ def main(argv: list[str] | None = None) -> int:
             body = target_payload(args)
             body.update({"method": args.method, "steps": args.steps, "hold": args.hold,
                          "ease": args.ease, "distance": args.distance,
-                         "release": args.release,
+                         "release": args.release, "batch": args.batch,
                          "restore_cursor": args.restore_cursor})
             if args.delay != 0.02:
                 body["delay"] = args.delay

@@ -78,6 +78,18 @@ bgserver.py —— 后台点击/截图的常驻本地服务（供 agent skill �
      真移动光标、真按下、真滚轮。给「合成消息当没发生」的程序用 ——
      鼠标位置是全局状态，程序会去查真实光标，消息伪造不了状态，
      所以这类程序的滑动/拖拽只有真输入一条路。代价是占用真实光标（前台行为）。
+
+1.4.0 新增：
+ 10. method="sendinput"：走系统输入队列（SendInput），鼠标轨迹/拖拽可**整批原子提交**
+     （不会被用户真实鼠标插队拆散），坐标走 VIRTUALDESK 归一化。
+ 11. /key 的 sendinput 模式：默认只发**扫描码**（KEYEVENTF_SCANCODE，wVk=0）。
+     只读底层键盘输入的程序（DirectInput / Raw Input 类）对虚拟键码不买账、
+     对扫描码买账 —— 这就是「用扫描码」在键盘上的真实含义。
+     ★ 注意：扫描码是键盘概念，MOUSEINPUT 里没有扫描码字段；
+       鼠标侧的对应物是 SendInput 的 MOUSEEVENTF_MOVE|ABSOLUTE。
+     ★ 能力边界：SendInput 注入仍会被 Raw Input 识别（hDevice=NULL，
+       低级钩子有 LLMHF_INJECTED）。要「像真实硬件」只能上驱动级虚拟 HID，
+       不在本项目范围内。
 """
 
 from __future__ import annotations
@@ -103,7 +115,7 @@ from urllib.parse import urlparse, parse_qs
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bgclick as bc  # noqa: E402
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 DEFAULT_PORT = 8765
 
 # 允许截图落盘的根目录（启动时填充为绝对路径）
@@ -625,16 +637,29 @@ class Handler(BaseHTTPRequestHandler):
           （GetGUIThreadInfo），拿不到才退回顶层窗口。键盘消息必须命中焦点控件，
           否则程序收到也当没收到。
 
-        ★ 只支持 post / send 两种投递方式。真键盘（SendInput）是全局的，
-          会打进用户正在用的窗口，本接口不提供 —— 需要就用 bgclick.py --method hardware。
+        ★ method 支持 post / send / **sendinput**：
+          post/send   把键盘消息投给目标窗口（后台，不动焦点，但有些程序不认）；
+          sendinput   ★ SendInput 走系统输入队列，默认**只发扫描码**
+                      （KEYEVENTF_SCANCODE）—— 只读底层键盘输入的程序
+                      （DirectInput / Raw Input 类）对虚拟键码不买账，
+                      对扫描码买账。代价：会打进**当前前台窗口**，
+                      所以会先把目标窗口调到前台，属于前台行为。
+                      注意 Raw Input 程序仍能通过 hDevice=NULL 识别出这是注入，
+                      要「像真实硬件」只能上驱动级，不在本服务范围内。
         """
         target = find_target(body)
         hwnd = target["hwnd"]
-        dest = _find_focus_window(hwnd) or hwnd
 
         method = body.get("method", "post")
-        if method not in ("post", "send"):
-            raise bc.AppError("method 只能是 post / send", code=2)
+        if method not in ("post", "send", "sendinput"):
+            raise bc.AppError("method 只能是 post / send / sendinput", code=2)
+
+        if method == "sendinput":
+            # 真键盘是全局的：先把目标调到前台，否则按键会打进别人窗口
+            bc.user32.SetForegroundWindow(hwnd)
+            time.sleep(0.15)
+
+        dest = hwnd if method == "sendinput" else (_find_focus_window(hwnd) or hwnd)
         repeat = clamp_int(body.get("repeat"), 1, 1000, "repeat", 1)
         interval = float(body.get("interval", 0.06))
         hold_gap = float(body.get("hold_gap", 0.02))
@@ -681,9 +706,13 @@ class Handler(BaseHTTPRequestHandler):
         # --- 模式 1：组合键 ---
         if specs:
             chords = [bc.parse_chord(s) for s in specs]
-            result = bc.send_key_sequence(dest, chords, method=method, repeat=repeat,
-                                          interval=interval, hold=hold_gap,
-                                          with_char=with_char)
+            if method == "sendinput":
+                result = bc.send_input_chords(chords, repeat=repeat, interval=interval,
+                                              use_scancode=bool(body.get("scancode", True)))
+            else:
+                result = bc.send_key_sequence(dest, chords, method=method, repeat=repeat,
+                                              interval=interval, hold=hold_gap,
+                                              with_char=with_char)
             result["mode"] = "chord"
             result["specs"] = specs
 
@@ -692,7 +721,12 @@ class Handler(BaseHTTPRequestHandler):
             vks = bc.parse_key_list(keys)
             if len(vks) > 32:
                 raise bc.AppError("keys 一次最多 32 个键", code=2)
-            if body.get("hold") or body.get("hold_seconds") is not None:
+            if method == "sendinput":
+                result = bc.send_input_keys_hold(
+                    vks, hold_seconds=float(body.get("hold_seconds", 0.2)),
+                    repeat=clamp_int(repeat, 1, 100, "repeat", 1),
+                    interval=interval, use_scancode=bool(body.get("scancode", True)))
+            elif body.get("hold") or body.get("hold_seconds") is not None:
                 hold_seconds = float(body.get("hold_seconds", 0.5))
                 if not (0 <= hold_seconds <= 3600):
                     raise bc.AppError("hold_seconds 必须在 0~3600 秒之间", code=2)
@@ -733,11 +767,15 @@ class Handler(BaseHTTPRequestHandler):
         else:
             if len(text) > 4096:
                 raise bc.AppError("text 过长（上限 4096 字符）", code=2)
-            mode = str(body.get("mode", "auto")).lower()
-            if mode not in ("auto", "keys", "both"):
-                raise bc.AppError("mode 只能是 auto / keys / both", code=2)
-            result = bc.send_text_as_keys(dest, text, method=method, mode=mode,
-                                          hold=hold_gap, interval=max(0.005, interval))
+            if method == "sendinput":
+                result = bc.send_input_text(text, interval=max(0.005, interval),
+                                            use_scancode=bool(body.get("scancode", True)))
+            else:
+                mode = str(body.get("mode", "auto")).lower()
+                if mode not in ("auto", "keys", "both"):
+                    raise bc.AppError("mode 只能是 auto / keys / both", code=2)
+                result = bc.send_text_as_keys(dest, text, method=method, mode=mode,
+                                              hold=hold_gap, interval=max(0.005, interval))
             result["mode"] = "text"
             result["specs"] = [text[:64]]
 
