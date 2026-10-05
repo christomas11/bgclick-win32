@@ -1,0 +1,20 @@
+# 虚拟环境（含 build/dist 产物，不入库）
+env/
+.venv/
+venv/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 截图产物
+shots/
+
+# IDE / 工程缓存
+.vs/
+.idea/
+*.user
+
+# 运行时状态与日志（正常状态目录在 %USERPROFILE%\.bgclick，这里兜底）
+.bgstate/
+*.log
