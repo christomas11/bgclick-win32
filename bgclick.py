@@ -2194,8 +2194,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="结束时不抬键（留一个按住状态，慎用）")
     p.add_argument("--no-to-start", dest="to_start", action="store_false", default=True,
                    help="手势走完不回到起点")
-    p.add_argument("--no-deep", dest="deep", action="store_false", default=True,
-                   help="不钻取子控件，直接发给顶层窗口")
+    # 注意：--no-deep 在上面（点击那组参数里）已经注册过，这里不能重复注册，
+    # 否则 argparse 直接抛 "conflicting option string" —— 滑动复用同一个开关。
     p.add_argument("--scroll", type=int, default=None,
                    help="滚轮格数（正数向上/向左，负数向下/向右）")
     p.add_argument("--axis", default="vertical", choices=["vertical", "horizontal"],
