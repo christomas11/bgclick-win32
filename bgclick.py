@@ -30,6 +30,25 @@ bgclick.py —— Windows 后台窗口点击器（纯消息投递，不抢光标
   # 6) 无限循环，每次 5 秒，偏移抖动 ±3 像素
   python bgclick.py --title "xxx" --pos 400,300 --count 0 --interval 5 --jitter 3
 
+键盘（1.1.0 新增，也是纯消息投递，同样不抢焦点）
+--------------------------------------------------
+  原来只有 WM_CHAR 文本通道，只对编辑框有效；菜单快捷键、IDE、游戏、
+  画布控件都是直接读 WM_KEYDOWN 的虚拟键码，对 WM_CHAR 一律当没看见。
+
+  标准投递（send_chord / send_key_sequence / send_text_as_keys）：
+    send_text_as_keys(hwnd, "Hello!")          逐字符真按键（Shift 自动补上）
+    send_chord(hwnd, parse_chord("ctrl+shift+s"))
+    send_key_sequence(hwnd, [parse_chord("ctrl+a"), parse_chord("ctrl+c")])
+
+   ★ 多键同按（按住不放）用 send_keys_state —— 只发 down 或只发 up，不配对：
+    vks = parse_key_list(["ctrl", "shift", "a"])
+    send_keys_state(hwnd, vks, keyup=False)     # 三键同时按住
+    time.sleep(1.5)                             # 想按多久按多久
+    send_keys_state(hwnd, list(reversed(vks)), keyup=True)   # 倒序松开
+
+   lParam 按 Windows 规范组装（扫描码 / 扩展键 / Alt 的 SYS 消息升级都处理了），
+   Alt 组合会自动走 WM_SYSKEYDOWN/UP。详见「键盘」那一节的注释。
+
 权限（重要！）
 --------------
 Windows 的 UIPI（用户界面特权隔离）规则：**只有完整性级别(IL) >= 目标 IL 的进程，
@@ -225,6 +244,21 @@ user32.mouse_event.argtypes = [
     wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p
 ]
 user32.mouse_event.restype = None
+
+# --- 键盘相关 ---
+# 注意：键盘消息和鼠标消息一样受 UIPI 过滤（低 IL 发不进高 IL 窗口）。
+# 这几个函数只在本进程里做「按键 ↔ 字符」换算，不往目标窗口发任何东西。
+user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+user32.MapVirtualKeyW.restype = wintypes.UINT
+
+user32.VkKeyScanW.argtypes = [ctypes.c_wchar]
+user32.VkKeyScanW.restype = ctypes.c_short
+
+user32.ToUnicodeEx.argtypes = [
+    wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_ubyte),
+    wintypes.LPWSTR, ctypes.c_int, wintypes.UINT, wintypes.HKL,
+]
+user32.ToUnicodeEx.restype = ctypes.c_int
 
 user32.GetSystemMetrics.argtypes = [ctypes.c_int]
 user32.GetSystemMetrics.restype = ctypes.c_int
@@ -787,6 +821,509 @@ def do_click(hwnd: int, x: int, y: int, args) -> dict:
     if args.method == "send":
         return send_click_send(hwnd, x, y, args.button)
     return send_click_hardware(hwnd, x, y, args.button, restore_cursor=args.restore_cursor)
+
+
+# --------------------------------------------------------------------------
+# 键盘：虚拟键 / 组合键 / 字符（同样走消息投递，不抢焦点）
+# --------------------------------------------------------------------------
+#
+# 为什么不能只用 WM_CHAR：
+#   原来的文本输入是逐字符投 WM_CHAR，只对「真的要字符」的控件（编辑框、
+#   输入框）有效。菜单快捷键、IDE、游戏、画布类控件都是直接读 WM_KEYDOWN
+#   的虚拟键码，收到 WM_CHAR 一律当没看见。所以必须有真正的键盘通路。
+#
+# 组合键（Ctrl+S、Shift+A）必须按真实顺序发：
+#   修饰键按下 → 主键按下 → 主键抬起 → 修饰键抬起（倒序）
+# ★ 顺序错了程序就不认：很多程序只在「主键按下那一刻修饰键仍处于按下状态」
+#   时才当快捷键处理。
+#
+# ★ lParam 不能随手填 0：
+#   bit 0-15  重复次数
+#   bit 16-23 扫描码（不填的话，方向键/Delete 之类可能被认成小键盘数字）
+#   bit 24    扩展键标志（右 Ctrl/Alt、方向键、Home/End/Delete、Win 键…）
+#   bit 29    context code（Alt 按下期间为 1，与 WM_SYSKEYxxx 配套）
+#   bit 30/31 前一次按键状态 / 转换状态（抬起时都要置 1）
+#
+# Alt 的坑：Alt 按下期间，Windows 把键盘消息**升级成 SYS 版本**
+#   （WM_SYSKEYDOWN / WM_SYSKEYUP），不是 WM_KEYDOWN。所以这里要跟踪 Alt 状态。
+
+WM_KEYDOWN, WM_KEYUP = 0x0100, 0x0101
+WM_CHAR = 0x0102
+WM_SYSKEYDOWN, WM_SYSKEYUP = 0x0104, 0x0105
+
+MAPVK_VK_TO_VSC = 0
+
+# --- 虚拟键码 ---
+VK_BACK, VK_TAB, VK_RETURN = 0x08, 0x09, 0x0D
+VK_SHIFT, VK_CONTROL, VK_MENU, VK_CAPITAL = 0x10, 0x11, 0x12, 0x14
+VK_ESCAPE, VK_SPACE = 0x1B, 0x20
+VK_PRIOR, VK_NEXT, VK_END, VK_HOME = 0x21, 0x22, 0x23, 0x24
+VK_LEFT, VK_UP, VK_RIGHT, VK_DOWN = 0x25, 0x26, 0x27, 0x28
+VK_SNAPSHOT, VK_INSERT, VK_DELETE = 0x2C, 0x2D, 0x2E
+VK_LWIN, VK_RWIN, VK_APPS = 0x5B, 0x5C, 0x5D
+VK_NUMPAD0 = 0x60
+VK_MULTIPLY, VK_ADD, VK_SEPARATOR = 0x6A, 0x6B, 0x6C
+VK_SUBTRACT, VK_DECIMAL, VK_DIVIDE = 0x6D, 0x6E, 0x6F
+VK_NUMLOCK, VK_SCROLL = 0x90, 0x91
+VK_LSHIFT, VK_RSHIFT = 0xA0, 0xA1
+VK_LCONTROL, VK_RCONTROL = 0xA2, 0xA3
+VK_LMENU, VK_RMENU = 0xA4, 0xA5
+# OEM 键（美式布局的位置名，中文键盘位置一致）
+VK_OEM_PLUS, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD = 0xBB, 0xBC, 0xBD, 0xBE
+VK_OEM_2, VK_OEM_3 = 0xBF, 0xC0
+VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7 = 0xDB, 0xDC, 0xDD, 0xDE
+
+# 需要置 lParam bit24（扩展键）的键。不置的后果：程序把方向键认成小键盘数字。
+EXTENDED_VKS = frozenset({
+    VK_RCONTROL, VK_RMENU, VK_INSERT, VK_DELETE, VK_HOME, VK_END,
+    VK_PRIOR, VK_NEXT, VK_LEFT, VK_UP, VK_RIGHT, VK_DOWN,
+    VK_NUMLOCK, VK_DIVIDE, VK_SNAPSHOT, VK_LWIN, VK_RWIN, VK_APPS,
+})
+
+_KEY_TABLE: dict[str, int] = {
+    # 编辑键
+    "backspace": VK_BACK, "bs": VK_BACK, "back": VK_BACK,
+    "tab": VK_TAB, "enter": VK_RETURN, "return": VK_RETURN, "cr": VK_RETURN,
+    "esc": VK_ESCAPE, "escape": VK_ESCAPE, "space": VK_SPACE, "spacebar": VK_SPACE,
+    "insert": VK_INSERT, "ins": VK_INSERT, "delete": VK_DELETE, "del": VK_DELETE,
+    "home": VK_HOME, "end": VK_END,
+    "pageup": VK_PRIOR, "pgup": VK_PRIOR, "pagedown": VK_NEXT, "pgdn": VK_NEXT,
+    # 方向键
+    "left": VK_LEFT, "up": VK_UP, "right": VK_RIGHT, "down": VK_DOWN,
+    # 修饰键
+    "shift": VK_SHIFT, "lshift": VK_LSHIFT, "rshift": VK_RSHIFT,
+    "ctrl": VK_CONTROL, "control": VK_CONTROL, "ctl": VK_CONTROL,
+    "lctrl": VK_LCONTROL, "lcontrol": VK_LCONTROL,
+    "rctrl": VK_RCONTROL, "rcontrol": VK_RCONTROL,
+    "alt": VK_MENU, "menu": VK_MENU, "lalt": VK_LMENU, "ralt": VK_RMENU,
+    "win": VK_LWIN, "lwin": VK_LWIN, "rwin": VK_RWIN, "super": VK_LWIN, "cmd": VK_LWIN,
+    "apps": VK_APPS, "contextmenu": VK_APPS,
+    # 锁定 / 系统
+    "capslock": VK_CAPITAL, "caps": VK_CAPITAL,
+    "numlock": VK_NUMLOCK, "scrolllock": VK_SCROLL, "scroll": VK_SCROLL,
+    "printscreen": VK_SNAPSHOT, "prtsc": VK_SNAPSHOT, "pause": 0x13, "break": 0x03,
+    # 小键盘符号
+    "multiply": VK_MULTIPLY, "add": VK_ADD, "subtract": VK_SUBTRACT,
+    "decimal": VK_DECIMAL, "divide": VK_DIVIDE, "separator": VK_SEPARATOR,
+    # 多媒体
+    "volume_mute": 0xAD, "volume_down": 0xAE, "volume_up": 0xAF,
+    "next_track": 0xB0, "prev_track": 0xB1, "stop_media": 0xB2, "play_pause": 0xB3,
+    # OEM 符号键（'+' / '-' / '.' / ',' 这些字符本身建议写成 plus/minus/period/comma，
+    # 因为 '+' 是组合键的分隔符，直接写 ctrl++ 会被解析坏）
+    "plus": VK_OEM_PLUS, "equal": VK_OEM_PLUS, "equals": VK_OEM_PLUS,
+    "minus": VK_OEM_MINUS, "comma": VK_OEM_COMMA, "period": VK_OEM_PERIOD,
+    "dot": VK_OEM_PERIOD, "slash": VK_OEM_2, "grave": VK_OEM_3, "backtick": VK_OEM_3,
+    "bracketleft": VK_OEM_4, "lbracket": VK_OEM_4,
+    "backslash": VK_OEM_5, "bracketright": VK_OEM_6, "rbracket": VK_OEM_6,
+    "quote": VK_OEM_7, "apostrophe": VK_OEM_7,
+}
+for _i in range(1, 25):                       # F1 = 0x70 ... F24 = 0x87
+    _KEY_TABLE[f"f{_i}"] = 0x6F + _i
+for _i in range(10):                          # 小键盘 0-9
+    _KEY_TABLE[f"numpad{_i}"] = VK_NUMPAD0 + _i
+
+
+def _is_alt_vk(vk: int) -> bool:
+    return vk in (VK_MENU, VK_LMENU, VK_RMENU)
+
+
+def _is_modifier_vk(vk: int) -> bool:
+    return vk in (VK_SHIFT, VK_CONTROL, VK_MENU, VK_LSHIFT, VK_RSHIFT,
+                  VK_LCONTROL, VK_RCONTROL, VK_LMENU, VK_RMENU, VK_LWIN, VK_RWIN)
+
+
+def _resolve_key_token(token: str) -> list[int]:
+    """
+    把一个按键名/字符解析成虚拟键序列。
+
+    返回列表是因为一个字符可能需要配修饰键才打得出来：
+    "!" → [VK_SHIFT, 0x31]，"a" → [0x41]。
+    """
+    t = token.strip()
+    low = t.lower()
+    if not t:
+        raise AppError("按键名是空的", code=2)
+    if low in _KEY_TABLE:
+        return [_KEY_TABLE[low]]
+    if len(t) == 1:
+        if "a" <= low <= "z":
+            return [ord(low.upper())]
+        if "0" <= t <= "9":
+            return [ord(t)]
+        sc = int(user32.VkKeyScanW(t))
+        if sc >= 0 and (sc & 0xFFFF) != 0xFFFF:
+            out: list[int] = []
+            state = (sc >> 8) & 0xFF
+            if state & 1:
+                out.append(VK_SHIFT)
+            if state & 2:
+                out.append(VK_CONTROL)
+            if state & 4:
+                out.append(VK_MENU)
+            out.append(sc & 0xFF)
+            return out
+        raise AppError(f"当前键盘布局打不出字符 {t!r}（可以改用 --text 走字符通道）", code=2)
+    if low.startswith("0x"):
+        try:
+            return [int(low, 16)]
+        except ValueError:
+            pass
+    if t.isdigit():
+        return [int(t)]
+    raise AppError(
+        f"认不出的按键名 {t!r}。可用：a-z / 0-9 / f1-f24 / enter / esc / tab / space / "
+        f"backspace / delete / home / end / pageup / pagedown / up / down / left / right / "
+        f"ctrl / shift / alt / win / plus / minus / comma / period …，"
+        f"也可以直接写虚拟键码（0x41 或 65）", code=2)
+
+
+def parse_chord(spec: str) -> list[int]:
+    """
+    解析组合键字符串。返回「按下顺序」的虚拟键列表，最后一个是主键。
+
+      "ctrl+shift+s" → [VK_CONTROL, VK_SHIFT, 0x53]
+      "shift+a"      → [VK_SHIFT, 0x41]
+      "alt+f4"       → [VK_MENU, 0x73]
+      "enter"        → [0x0D]
+
+    ★ 分隔符只有 '+'（两侧空格随意）。想按加号键本身请写 ctrl+plus。
+    """
+    raw = [t.strip() for t in re.split(r"\+", spec) if t.strip()]
+    if not raw:
+        raise AppError("组合键是空的", code=2)
+
+    vks: list[int] = []
+    for t in raw:
+        vks.extend(_resolve_key_token(t))
+
+    # 主键 = 最后一个「非修饰键」；整串都是修饰键时就取最后一个
+    main_idx = None
+    for i, vk in enumerate(vks):
+        if not _is_modifier_vk(vk):
+            main_idx = i
+    if main_idx is None:
+        main_idx = len(vks) - 1
+
+    mods = vks[:main_idx] + vks[main_idx + 1:]
+    return mods + [vks[main_idx]]
+
+
+def make_key_lparam(scancode: int, extended: bool = False, keyup: bool = False,
+                    repeat: int = 1, alt_down: bool = False) -> int:
+    """按 Windows 的键盘消息规范组装 lParam（位含义见本节开头）。"""
+    lp = repeat & 0xFFFF
+    lp |= (scancode & 0xFF) << 16
+    if extended:
+        lp |= 1 << 24
+    if alt_down:
+        lp |= 1 << 29
+    if keyup:
+        lp |= (1 << 30) | (1 << 31)
+    return lp
+
+
+def key_scancode(vk: int) -> int:
+    """虚拟键码 → 扫描码（填进 lParam 的 bit16-23）。"""
+    try:
+        sc = int(user32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC))
+    except Exception:
+        return 0
+    return sc & 0xFF
+
+
+def _dispatch_key_msg(hwnd: int, msg: int, wp: int, lp: int, method: str) -> tuple[bool, int]:
+    """按 method 投递一条键盘消息。返回 (是否成功, 错误码)。"""
+    if method == "send":
+        out = ctypes.c_size_t(0)
+        ctypes.set_last_error(0)
+        res = user32.SendMessageTimeoutW(hwnd, msg, wp, lp,
+                                         SMTO_ABORTIFHUNG | SMTO_BLOCK, 1000,
+                                         ctypes.byref(out))
+        err = ctypes.get_last_error()
+        if res == 0 and err:
+            return False, err
+        # ★ SendMessageTimeout 返回 0 既可能是失败也可能是「处理结果就是 0」，
+        #   所以只有 last_error 非 0 才算失败。
+        return True, 0
+    return post_checked(hwnd, msg, wp, lp)
+
+
+def key_char(vk: int, shift: bool = False, ctrl: bool = False,
+             alt: bool = False, caps: bool = False) -> Optional[str]:
+    """
+    算出「这个键在当前键盘布局下会打出什么字符」。
+
+    用 ToUnicodeEx 而不是 MapVirtualKey，因为只有它认得出 Shift 状态：
+    MapVirtualKey(VK_TO_CHAR) 对 'A' 永远返回 'a'，Shift+1 也算不出 '!'。
+    0x4 标志是「不要改动内核里的键盘状态」，免得污染用户的真实输入。
+    """
+    state = (ctypes.c_ubyte * 256)()
+    if shift:
+        state[VK_SHIFT] = 0x80
+    if ctrl:
+        state[VK_CONTROL] = 0x80
+    if alt:
+        state[VK_MENU] = 0x80
+    if caps:
+        state[VK_CAPITAL] = 0x01
+    buf = ctypes.create_unicode_buffer(8)
+    try:
+        n = int(user32.ToUnicodeEx(vk, key_scancode(vk), state, buf, 8, 0x4, None))
+    except Exception:
+        return None
+    if n >= 1:
+        s = buf[:n]
+        return s if s else None
+    return None                     # 0 = 打不出字符，-1 = 死键
+
+
+def _stalled(events: list[dict]) -> bool:
+    """一旦有消息被拒（UIPI 等），后面的就不用发了 —— 结果只会一样。"""
+    return bool(events) and not events[-1].get("ok")
+
+
+def send_chord(hwnd: int, vks: list[int], method: str = "post", hold: float = 0.02,
+               with_char: Optional[bool] = None) -> dict:
+    """
+    投递**一次**组合键。vks 的最后一个是主键，前面的都是要同时按住的修饰键。
+
+    with_char：
+      True  → 主键按下后补一条 WM_CHAR（保证编辑框真的出字符）
+      False → 只发按键消息
+      None  → 自动：不含 Ctrl / Alt / Win 时才补（Shift+字母 会补 'A'；
+              Ctrl+S 不补，免得给程序塞一个 0x13 控制字符）
+
+    返回 {"ok", "sent", "failed", "events": [...]}
+    """
+    if not vks:
+        raise AppError("组合键为空", code=2)
+
+    main = vks[-1]
+    mods = vks[:-1]
+    shift = any(v in (VK_SHIFT, VK_LSHIFT, VK_RSHIFT) for v in vks)
+    ctrl = any(v in (VK_CONTROL, VK_LCONTROL, VK_RCONTROL) for v in vks)
+    alt = any(_is_alt_vk(v) for v in vks)
+    win = any(v in (VK_LWIN, VK_RWIN) for v in vks)
+
+    if with_char is None:
+        with_char = not (ctrl or alt or win)
+
+    ch = key_char(main, shift=shift, ctrl=ctrl, alt=alt) if with_char else None
+
+    events: list[dict] = []
+    sent = 0
+    failed = 0
+    alt_state = False
+
+    def fire(vk: int, keyup: bool) -> None:
+        nonlocal sent, failed
+        if alt_state:
+            msg = WM_SYSKEYUP if keyup else WM_SYSKEYDOWN
+        else:
+            msg = WM_KEYUP if keyup else WM_KEYDOWN
+        lp = make_key_lparam(key_scancode(vk), vk in EXTENDED_VKS,
+                             keyup=keyup, alt_down=alt_state)
+        ok, err = _dispatch_key_msg(hwnd, msg, vk, lp, method)
+        events.append({"vk": vk, "vk_hex": hex(vk), "msg": hex(msg),
+                       "keyup": keyup, "ok": ok, "error": err})
+        if ok:
+            sent += 1
+        else:
+            failed += 1
+
+    # 1) 修饰键按下（Alt 要先更新状态：之后的消息得升级成 SYS 版本）
+    for vk in mods:
+        if _is_alt_vk(vk):
+            alt_state = True
+        fire(vk, False)
+        if _stalled(events):
+            break
+
+    if not _stalled(events):
+        time.sleep(max(0.0, hold))
+        # 2) 主键按下
+        fire(main, False)
+        # 3) 补 WM_CHAR（走字符通路的控件只认这个）
+        if ch and not _stalled(events):
+            lp = make_key_lparam(key_scancode(main), main in EXTENDED_VKS, alt_down=alt_state)
+            ok, err = _dispatch_key_msg(hwnd, WM_CHAR, ord(ch[0]), lp, method)
+            events.append({"vk": main, "vk_hex": hex(main), "msg": hex(WM_CHAR),
+                           "char": ch[0], "keyup": False, "ok": ok, "error": err})
+            if ok:
+                sent += 1
+            else:
+                failed += 1
+        # 4) 主键抬起
+        if not _stalled(events):
+            fire(main, True)
+        time.sleep(max(0.0, hold))
+
+    # 5) 修饰键抬起（倒序，和真实键盘一致）
+    for vk in reversed(mods):
+        if _stalled(events):
+            break
+        fire(vk, True)
+        if _is_alt_vk(vk):
+            alt_state = False
+
+    return {"ok": failed == 0 and sent > 0, "sent": sent, "failed": failed,
+            "chord": [hex(v) for v in vks], "with_char": bool(with_char),
+            "char": ch, "events": events}
+
+
+def send_key_sequence(hwnd: int, chords: list[list[int]], method: str = "post",
+                      repeat: int = 1, interval: float = 0.06, hold: float = 0.02,
+                      with_char: Optional[bool] = None) -> dict:
+    """
+    投递一串组合键（每个 chord 一次完整的按下-抬起），可重复。
+    interval 是「两次组合之间」的间隔，hold 是「修饰键与主键之间」的间隔。
+    """
+    events: list[dict] = []
+    sent = 0
+    failed = 0
+    runs = 0
+    stop = False
+
+    for _ in range(max(1, repeat)):
+        if stop:
+            break
+        for i, vks in enumerate(chords):
+            rec = send_chord(hwnd, vks, method=method, hold=hold, with_char=with_char)
+            events.extend(rec["events"])
+            sent += rec["sent"]
+            failed += rec["failed"]
+            runs += 1
+            if rec["failed"]:
+                stop = True          # 失败即停，别把同一个错误刷一屏
+                break
+            if i < len(chords) - 1:
+                time.sleep(max(0.0, interval))
+        if not stop and repeat > 1:
+            time.sleep(max(0.0, interval))
+
+    return {"ok": failed == 0 and sent > 0, "sent": sent, "failed": failed,
+            "runs": runs,
+            "chords": [[hex(v) for v in c] for c in chords],
+            "repeat": max(1, repeat), "method": method,
+            "events": events[-40:]}
+
+
+def send_text_as_keys(hwnd: int, text: str, method: str = "post", hold: float = 0.015,
+                      interval: float = 0.01) -> dict:
+    """
+    逐字符「真按键」输入：每个字符拆成 修饰键+主键，走 WM_KEYDOWN/UP，再补 WM_CHAR。
+    比纯 WM_CHAR 更接近真人打字，需要按键的程序也吃得下。
+
+    当前键盘布局打不出的字符（中文、emoji 等）自动退回直接投 WM_CHAR。
+    """
+    events: list[dict] = []
+    sent = 0
+    failed = 0
+    typed = 0
+    fallback = 0
+
+    for one in text:
+        if failed:
+            break
+        sc = int(user32.VkKeyScanW(one))
+        if sc < 0 or (sc & 0xFFFF) == 0xFFFF:
+            ok, err = _dispatch_key_msg(hwnd, WM_CHAR, ord(one), 1, method)
+            events.append({"char": one, "msg": hex(WM_CHAR), "ok": ok,
+                           "error": err, "via": "wm_char"})
+            fallback += 1
+            if ok:
+                sent += 1
+            else:
+                failed += 1
+            time.sleep(max(0.0, interval))
+            continue
+
+        state = (sc >> 8) & 0xFF
+        vks: list[int] = []
+        if state & 1:
+            vks.append(VK_SHIFT)
+        if state & 2:
+            vks.append(VK_CONTROL)
+        if state & 4:
+            vks.append(VK_MENU)
+        vks.append(sc & 0xFF)
+
+        rec = send_chord(hwnd, vks, method=method, hold=hold, with_char=True)
+        events.extend(rec["events"])
+        sent += rec["sent"]
+        failed += rec["failed"]
+        typed += 1
+        time.sleep(max(0.0, interval))
+
+    return {"ok": failed == 0 and sent > 0, "sent": sent, "failed": failed,
+            "typed_chars": typed, "wm_char_fallback": fallback,
+            "method": method, "events": events[-40:]}
+
+
+def parse_key_list(items) -> list[int]:
+    """
+    把 ["ctrl", "shift", "a"] 按**原顺序**解析成虚拟键列表。
+
+    和 parse_chord 的区别：这里不把主键挪到末尾 —— 给「按住 / 松开」用，
+    顺序由调用方说了算。
+    """
+    out: list[int] = []
+    for t in items:
+        out.extend(_resolve_key_token(str(t)))
+    if not out:
+        raise AppError("按键列表是空的", code=2)
+    return out
+
+
+def send_keys_state(hwnd: int, vks: list[int], keyup: bool, method: str = "post",
+                    include_char: bool = False) -> dict:
+    """
+    只发「按下」或只发「松开」，不配对 —— 用来实现真正的多键同按：
+    先 down [ctrl, shift, a]，隔一会儿再 up [a, shift, ctrl]。
+
+    include_char=True 时，在主键按下后补一条 WM_CHAR（仅 keyup=False 有意义）。
+    """
+    events: list[dict] = []
+    sent = 0
+    failed = 0
+    alt_state = any(_is_alt_vk(v) for v in vks)   # 松开 Alt 时它自己仍算「Alt 按下中」
+
+    for vk in vks:
+        if not keyup and _is_alt_vk(vk):
+            alt_state = True
+        if alt_state:
+            msg = WM_SYSKEYUP if keyup else WM_SYSKEYDOWN
+        else:
+            msg = WM_KEYUP if keyup else WM_KEYDOWN
+        lp = make_key_lparam(key_scancode(vk), vk in EXTENDED_VKS,
+                             keyup=keyup, alt_down=alt_state)
+        ok, err = _dispatch_key_msg(hwnd, msg, vk, lp, method)
+        events.append({"vk": vk, "vk_hex": hex(vk), "msg": hex(msg),
+                       "keyup": keyup, "ok": ok, "error": err})
+        if ok:
+            sent += 1
+        else:
+            failed += 1
+            break                      # 失败即停
+
+    if include_char and not keyup and not failed:
+        main = vks[-1]
+        shift = any(v in (VK_SHIFT, VK_LSHIFT, VK_RSHIFT) for v in vks)
+        ctrl = any(v in (VK_CONTROL, VK_LCONTROL, VK_RCONTROL) for v in vks)
+        alt = any(_is_alt_vk(v) for v in vks)
+        ch = None if (ctrl or alt) else key_char(main, shift=shift)
+        if ch:
+            lp = make_key_lparam(key_scancode(main), main in EXTENDED_VKS, alt_down=alt)
+            ok, err = _dispatch_key_msg(hwnd, WM_CHAR, ord(ch[0]), lp, method)
+            events.append({"vk": main, "vk_hex": hex(main), "msg": hex(WM_CHAR),
+                           "char": ch[0], "keyup": False, "ok": ok, "error": err})
+            if ok:
+                sent += 1
+            else:
+                failed += 1
+
+    return {"ok": failed == 0 and sent > 0, "sent": sent, "failed": failed,
+            "keyup": keyup, "events": events}
 
 
 def parse_pair(text: str) -> tuple[int, int]:

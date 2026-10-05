@@ -24,6 +24,11 @@ bgserver.py —— 后台点击/截图的常驻本地服务（供 agent skill �
   # 截图
   python bgclient.py shot --title "记事本" --out shots/note.png
 
+  # 键盘：组合键 / 多键同按 / 逐字符真按键（走 WM_KEYDOWN，不是 WM_CHAR）
+  python bgclient.py key --title "记事本" --keys ctrl+shift+s
+  python bgclient.py key --title "记事本" --hold ctrl+shift+a --hold-seconds 1.5
+  python bgclient.py key --title "记事本" --type "Hello!"
+
   # 停止
   python bgclient.py shutdown
 
@@ -53,6 +58,11 @@ bgserver.py —— 后台点击/截图的常驻本地服务（供 agent skill �
   4. do_restart 给新进程带 --_wait-for-port-release，
      避免新进程在老进程端口还没释放时误判「已有实例」而直接退出。
   5. 托盘初始化失败不再静默退回无托盘模式：写日志 + 弹 MessageBox。
+
+1.1.0 新增：
+  6. /key 接口 —— 键盘输入。单键、组合键（ctrl+shift+s）、多键同按（按住不放）、
+     逐字符真按键。走 WM_KEYDOWN/WM_KEYUP + 规范 lParam，不是原来只有的 WM_CHAR。
+     原来的 /text 保留不动（纯字符通道，适合中英文文本）。
 """
 
 from __future__ import annotations
@@ -78,7 +88,7 @@ from urllib.parse import urlparse, parse_qs
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bgclick as bc  # noqa: E402
 
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 DEFAULT_PORT = 8765
 
 # 允许截图落盘的根目录（启动时填充为绝对路径）
@@ -429,6 +439,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_probe(body)
             elif u.path == "/text":
                 self._handle_text(body)
+            elif u.path == "/key":
+                self._handle_key(body)
             elif u.path == "/window":
                 # 客户端用 POST 发目标信息（和 click/shot 保持一致），
                 # 所以这里也要收 POST —— 只注册 GET 会让它 404。
@@ -566,6 +578,152 @@ class Handler(BaseHTTPRequestHandler):
             bc.post_checked(dest, 0x0100, 0x0D, 0)   # WM_KEYDOWN VK_RETURN
             bc.post_checked(dest, 0x0101, 0x0D, 0)   # WM_KEYUP
         self._send(200, {"ok": True, "sent": sent, "target": hex(dest)})
+
+    def _handle_key(self, body: dict) -> None:
+        """
+        向窗口发送键盘输入：单键 / 组合键 / 多键同按。走的还是消息投递，不抢焦点。
+
+        ★ 三种模式，按 body 里给了哪个字段决定（互斥，一次只能用一种）：
+
+          1. chord / chords —— 组合键。修饰键的按下与抬起顺序由库自动配好：
+                 "chord": "ctrl+shift+s"          # 一次
+                 "chords": ["ctrl+a", "ctrl+c"]   # 依次
+               和 /text 的区别：这是真正的 WM_KEYDOWN 通路，菜单快捷键、
+               IDE、游戏、画布控件都吃；/text 的纯 WM_CHAR 它们一律当没看见。
+
+          2. keys（+ hold）—— 真正的「多键同按」。列表按原顺序按下：
+                 "keys": ["ctrl", "shift", "a"]
+                 "hold_seconds": 1.5              # 按住不放 1.5 秒再松开
+               不给 hold_seconds 就是一次普通的组合键（等于模式 1）。
+               松开顺序自动倒过来（先放主键，再放修饰键），和真人一致。
+
+          3. text —— 逐字符「真按键」输入，每个字符拆成 修饰键+主键 再补 WM_CHAR。
+                 当前键盘布局打不出的字符（中文、emoji）自动退回纯 WM_CHAR。
+
+        ★ 发给谁：和 /text 一样，优先发给目标窗口所在线程的焦点控件
+          （GetGUIThreadInfo），拿不到才退回顶层窗口。键盘消息必须命中焦点控件，
+          否则程序收到也当没收到。
+
+        ★ 只支持 post / send 两种投递方式。真键盘（SendInput）是全局的，
+          会打进用户正在用的窗口，本接口不提供 —— 需要就用 bgclick.py --method hardware。
+        """
+        target = find_target(body)
+        hwnd = target["hwnd"]
+        dest = _find_focus_window(hwnd) or hwnd
+
+        method = body.get("method", "post")
+        if method not in ("post", "send"):
+            raise bc.AppError("method 只能是 post / send", code=2)
+        repeat = clamp_int(body.get("repeat"), 1, 1000, "repeat", 1)
+        interval = float(body.get("interval", 0.06))
+        hold_gap = float(body.get("hold_gap", 0.02))
+        for name, val in (("interval", interval), ("hold_gap", hold_gap)):
+            if not (0 <= val <= 60):
+                raise bc.AppError(f"{name} 必须在 0~60 秒之间", code=2)
+        with_char = body.get("char")
+        if with_char is not None and not isinstance(with_char, bool):
+            raise bc.AppError("char 只能是 true / false", code=2)
+
+        # --- 收集组合键写法 ---
+        specs: list[str] = []
+        if body.get("chord") is not None:
+            if not isinstance(body["chord"], str):
+                raise bc.AppError("chord 必须是字符串，如 \"ctrl+shift+s\"", code=2)
+            specs.append(body["chord"])
+        if body.get("chords") is not None:
+            raw = body["chords"]
+            if not isinstance(raw, list) or not all(isinstance(x, str) for x in raw):
+                raise bc.AppError("chords 必须是字符串数组，如 [\"ctrl+a\", \"ctrl+c\"]", code=2)
+            specs.extend(raw)
+        if len(specs) > 64:
+            raise bc.AppError("一次最多 64 个组合键", code=2)
+        for s in specs:
+            if len(s) > 64:
+                raise bc.AppError(f"组合键写得太长：{s[:32]}…", code=2)
+
+        keys = body.get("keys")
+        text = body.get("text")
+        if keys is not None and not isinstance(keys, list):
+            raise bc.AppError("keys 必须是字符串数组，如 [\"ctrl\", \"shift\", \"a\"]", code=2)
+        if text is not None and not isinstance(text, str):
+            raise bc.AppError("text 必须是字符串", code=2)
+
+        modes = [bool(specs), keys is not None, text is not None]
+        if sum(modes) > 1:
+            raise bc.AppError("chord/chords、keys、text 只能选一种", code=2)
+        if not any(modes):
+            raise bc.AppError(
+                "得给一种键盘输入：chord（\"ctrl+s\"）/ chords（数组）/ keys（数组）/ text", code=2)
+
+        started = time.time()
+
+        # --- 模式 1：组合键 ---
+        if specs:
+            chords = [bc.parse_chord(s) for s in specs]
+            result = bc.send_key_sequence(dest, chords, method=method, repeat=repeat,
+                                          interval=interval, hold=hold_gap,
+                                          with_char=with_char)
+            result["mode"] = "chord"
+            result["specs"] = specs
+
+        # --- 模式 2：按键列表（可按住） ---
+        elif keys is not None:
+            vks = bc.parse_key_list(keys)
+            if len(vks) > 32:
+                raise bc.AppError("keys 一次最多 32 个键", code=2)
+            if body.get("hold") or body.get("hold_seconds") is not None:
+                hold_seconds = float(body.get("hold_seconds", 0.5))
+                if not (0 <= hold_seconds <= 3600):
+                    raise bc.AppError("hold_seconds 必须在 0~3600 秒之间", code=2)
+                repeat = clamp_int(repeat, 1, 100, "repeat", 1)
+                sent = failed = runs = 0
+                events: list[dict] = []
+                for _ in range(repeat):
+                    down = bc.send_keys_state(dest, vks, False, method,
+                                              include_char=bool(with_char))
+                    sent += down["sent"]
+                    failed += down["failed"]
+                    events.extend(down["events"])
+                    if down["failed"]:
+                        break
+                    time.sleep(hold_seconds)
+                    up = bc.send_keys_state(dest, list(reversed(vks)), True, method)
+                    sent += up["sent"]
+                    failed += up["failed"]
+                    events.extend(up["events"])
+                    runs += 1
+                    if up["failed"]:
+                        break
+                    if repeat > 1:
+                        time.sleep(max(0.0, interval))
+                result = {"ok": failed == 0 and sent > 0, "sent": sent, "failed": failed,
+                          "runs": runs, "held_seconds": hold_seconds,
+                          "keys": [hex(v) for v in vks], "with_char": bool(with_char),
+                          "events": events[-40:]}
+            else:
+                result = bc.send_key_sequence(dest, [vks], method=method, repeat=repeat,
+                                              interval=interval, hold=hold_gap,
+                                              with_char=with_char)
+                result["runs"] = result.get("runs", repeat)
+            result["mode"] = "keys"
+            result["specs"] = list(keys)
+
+        # --- 模式 3：逐字符真按键 ---
+        else:
+            if len(text) > 4096:
+                raise bc.AppError("text 过长（上限 4096 字符）", code=2)
+            result = bc.send_text_as_keys(dest, text, method=method,
+                                          hold=hold_gap, interval=max(0.005, interval))
+            result["mode"] = "text"
+            result["specs"] = [text[:64]]
+
+        result["elapsed"] = round(time.time() - started, 3)
+        result["hwnd"] = target["hwnd_hex"]
+        result["title"] = target["title"]
+        result["process"] = target["process"]
+        # 和 /click 一样：投递没成功就该让调用方看到失败（退出码 1）
+        self._send(200 if result.get("ok") else 400,
+                   {"ok": bool(result.get("ok")), "key": result, "target": hex(dest)})
 
 
 # --------------------------------------------------------------------------

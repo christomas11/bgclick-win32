@@ -12,6 +12,8 @@ bgclient.py —— bgserver 的命令行客户端（也给 agent skill 当调用
   python bgclient.py click --title "记事本" --pos 400,300
   python bgclient.py shot --title "记事本" --out shots/note.png
   python bgclient.py text --title "记事本" --text "hello" --enter
+  python bgclient.py key  --title "记事本" --keys ctrl+shift+s     # 组合键
+  python bgclient.py key  --title "记事本" --hold ctrl+shift+a     # 多键同按
   python bgclient.py shutdown                     # 停服务
 
 自动化友好
@@ -28,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -291,6 +294,9 @@ class Client:
     def text(self, **kw) -> dict:
         return self._request("POST", "/text", kw)
 
+    def key(self, **kw) -> dict:
+        return self._request("POST", "/key", kw)
+
     def shutdown(self) -> dict:
         return self._request("GET", "/shutdown")
 
@@ -426,6 +432,31 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--text", required=True, help="要输入的文本")
     sp.add_argument("--enter", action="store_true", help="末尾补一个回车")
 
+    sp = add("key", "键盘按键 / 组合键 / 多键同按（走 WM_KEYDOWN，不是 WM_CHAR）")
+    add_target_args(sp)
+    g = sp.add_mutually_exclusive_group(required=True)
+    g.add_argument("--keys", action="append", metavar="CHORD",
+                   help="组合键，可重复给（如 --keys ctrl+shift+s --keys f5）。"
+                        "解析：ctrl / shift / alt / win + 主键")
+    g.add_argument("--hold", metavar="KEYS",
+                   help="多键同按并按住不放，如 --hold ctrl+shift+a（逗号或加号分隔，"
+                        "也支持 ctrl,shift,a）")
+    g.add_argument("--type", dest="typed", metavar="TEXT",
+                   help="逐字符真按键输入（每个字符拆成 修饰键+主键，再补 WM_CHAR）")
+    sp.add_argument("--repeat", type=int, default=1, help="重复次数（默认 1）")
+    sp.add_argument("--interval", type=float, default=0.06,
+                    help="两次组合之间的间隔秒（默认 0.06；--type 为 0.01）")
+    sp.add_argument("--hold-gap", type=float, default=0.02,
+                    help="修饰键与主键之间的间隔秒（默认 0.02）")
+    sp.add_argument("--hold-seconds", type=float, default=0.5,
+                    help="--hold 的按住时长秒（默认 0.5）")
+    sp.add_argument("--method", default="post", choices=["post", "send"],
+                    help="投递方式（默认 post 纯后台；send 同步等待）")
+    sp.add_argument("--no-char", dest="char", action="store_false", default=None,
+                    help="不补 WM_CHAR，只发按键消息")
+    sp.add_argument("--with-char", dest="char", action="store_true", default=None,
+                    help="强制补 WM_CHAR（Ctrl/Alt 组合默认是不补的）")
+
     return p
 
 
@@ -533,6 +564,31 @@ def main(argv: list[str] | None = None) -> int:
             body = target_payload(args)
             body.update({"text": args.text, "enter": args.enter})
             return emit(client.text(**body), as_json)
+
+        if args.cmd == "key":
+            body = target_payload(args)
+            body.update({"repeat": args.repeat, "method": args.method,
+                         "hold_gap": args.hold_gap, "interval": args.interval})
+            if args.char is not None:
+                body["char"] = args.char
+            human = None
+            if args.keys:
+                body["chords"] = args.keys
+            elif args.hold:
+                # 同时接受 ctrl+shift+a 和 ctrl,shift,a 两种分隔写法
+                body["keys"] = [t for t in re.split(r"[+,]", args.hold) if t.strip()]
+                body["hold"] = True
+                body["hold_seconds"] = args.hold_seconds
+            else:
+                body["text"] = args.typed
+                body["interval"] = 0.01 if args.interval == 0.06 else args.interval
+            r = client.key(**body)
+            if r.get("ok"):
+                k = r.get("key", {})
+                what = args.hold or ("+".join(args.keys) if args.keys else args.typed)
+                human = (f"已投递 {k.get('sent')} 条键盘消息（{what}，"
+                         f"目标 {k.get('title')}，{k.get('elapsed')}s）")
+            return emit(r, as_json, human)
 
         return 1
 
