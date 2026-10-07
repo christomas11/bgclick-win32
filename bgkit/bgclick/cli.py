@@ -128,6 +128,32 @@ def build_parser() -> argparse.ArgumentParser:
                    help="滚轮格数（正数向上/向左，负数向下/向右）")
     p.add_argument("--axis", default="vertical", choices=["vertical", "horizontal"],
                    help="滚轮方向轴")
+
+    # ---- UIA 元素查询（不加 --uia-* 时这些参数不生效）----
+    # 用 UI Automation 读窗口里的元素树，按名字/类型查元素并拿到它的坐标。
+    # 解决的是「坐标得靠截图数像素」这个老问题；点击仍然走上面那套消息投递，
+    # 不抢光标。详见 bgkit/bgclick/uia.py 顶部的说明。
+    p.add_argument("--uia-walk", action="store_true",
+                   help="遍历目标窗口的 UIA 元素树并列出来")
+    p.add_argument("--uia-find", action="store_true",
+                   help="按 --uia-name / --uia-type / --uia-id 查找元素（只列结果，不点）")
+    p.add_argument("--uia-click", action="store_true",
+                   help="查找到元素后直接用它的中心点点击（走原有的后台投递通道）")
+    p.add_argument("--uia-name", help="按元素名匹配（默认子串，不区分大小写）")
+    p.add_argument("--uia-type", help="按控件类型匹配，如 Button / Edit / MenuItem（大小写不敏感）")
+    p.add_argument("--uia-id", help="按 AutomationId 匹配（子串）")
+    p.add_argument("--uia-class", help="按 ClassName 匹配（子串）")
+    p.add_argument("--uia-exact", action="store_true", help="--uia-name 改为完全匹配")
+    p.add_argument("--uia-interactive", action="store_true",
+                   help="只保留疑似可交互的元素（按钮/输入框/菜单项…）")
+    p.add_argument("--uia-max-depth", type=int, default=12,
+                   help="UIA 遍历深度上限（默认 12）")
+    p.add_argument("--uia-limit", type=int, default=500,
+                   help="UIA 最多采集多少个元素（默认 500；超了返回部分结果并标注截断）")
+    p.add_argument("--uia-index", type=int, default=0,
+                   help="匹配到多个元素时选第几个（默认 0）")
+    p.add_argument("--uia-tree", action="store_true",
+                   help="配合 --uia-find/--uia-click：以缩进树而非平铺列表输出")
     return p
 
 
@@ -833,6 +859,175 @@ def cmd_shot(args) -> int:
     return 0
 
 
+def cmd_uia(args) -> int:
+    """UIA 元素查询：--uia-walk / --uia-find / --uia-click 共用一个入口。
+
+    几种模式的关系：
+      walk   列出整棵树（可按 --uia-interactive 过滤交互元素）
+      find   按条件筛，只报告结果和坐标
+      click  按条件筛，然后**用元素的中心点走原有的后台点击通道**
+
+    ★ 坐标是屏幕坐标 -> 用 ClientToScreen 的逆运算换算成客户区坐标，
+      这样正好接上现有 click 那条「相对客户区」的坐标约定。
+    """
+    from . import uia as uiamod
+
+    cands = match_windows(args)
+    if not cands:
+        raise AppError("没找到匹配的窗口。跑一下 --list 看看？", code=1)
+    if args.index >= len(cands) or args.index < 0:
+        msg = [f"匹配到 {len(cands)} 个窗口，--index {args.index} 越界"]
+        msg += [f"  [{i}] {c['hwnd_hex']} {c['process']} | {c['title']}"
+                for i, c in enumerate(cands)]
+        raise AppError("\n".join(msg))
+
+    target_info = cands[args.index]
+    hwnd = target_info["hwnd"]
+
+    ok, why = uiamod.uia_available()
+    if not ok:
+        raise AppError(
+            f"这台机器上 UI Automation 不可用：{why}\n"
+            "UIA 依赖系统自带的 UIAutomationCore.dll，正常情况下不该缺。"
+            "如果这是在精简过的系统镜像里跑，UIA 查询这条路就用不了，"
+            "改用截图量坐标（--shot --client-only）。", code=2)
+
+    want_click = bool(args.uia_click)
+    by_condition = bool(args.uia_name or args.uia_type or args.uia_id or args.uia_class)
+
+    # --- 取结果 ---
+    if by_condition:
+        res = uiamod.find(
+            hwnd, name=args.uia_name, control_type=args.uia_type,
+            automation_id=args.uia_id, class_name=args.uia_class,
+            exact=args.uia_exact, interactive_only=args.uia_interactive,
+            max_depth=args.uia_max_depth, limit=args.uia_limit,
+        )
+    else:
+        if want_click:
+            raise AppError("--uia-click 得配合一个查找条件"
+                           "（--uia-name / --uia-type / --uia-id / --uia-class）", code=2)
+        res = uiamod.walk(hwnd, max_depth=args.uia_max_depth, limit=args.uia_limit,
+                          interactive_only=args.uia_interactive)
+
+    meta = {
+        "hwnd": target_info["hwnd_hex"],
+        "title": target_info["title"],
+        "process": target_info["process"],
+        "count": len(res.elements),
+        "truncated": res.truncated,
+        "limit": res.limit,
+        "visited": res.visited,
+        "max_depth": res.max_depth,
+        "elapsed": res.elapsed,
+        "failed_reason": res.failed_reason,
+    }
+
+    # --- 不点，只报告 ---
+    if not want_click:
+        payload = dict(meta)
+        payload["ok"] = True
+        payload["elements"] = [e.to_dict(hwnd) for e in res.elements]
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 0
+        print(f"目标：{target_info['hwnd_hex']}  {target_info['process']}  "
+              f"「{target_info['title']}」")
+        print(f"读到 {len(res.elements)} 个元素，visited={res.visited}，"
+              f"最深 {res.max_depth} 层，耗时 {res.elapsed}s"
+              + ("（已达采集上限，结果是部分内容）" if res.truncated else ""))
+        if res.failed_reason:
+            print(f"注意：{res.failed_reason}")
+        print()
+        if args.uia_tree or not by_condition:
+            print(uiamod.describe_tree(res, hwnd))
+        else:
+            for i, e in enumerate(res.elements):
+                c = e.center_in_client(hwnd)
+                print(f"[{i}] {e.control_type.lower():<14}"
+                      f"屏幕 {str(e.screen_center):<14}客户区 {str(c):<14}"
+                      f"\"{e.name[:44]}\""
+                      + ("  [可交互]" if e.is_interactive else ""))
+        return 0
+
+    # --- 查找并点击 ---
+    if not res.elements:
+        raise AppError(
+            "没找到匹配的 UIA 元素"
+            + (f"（--uia-name {args.uia_name!r}）" if args.uia_name else "")
+            + (f"（--uia-type {args.uia_type!r}）" if args.uia_type else "")
+            + "。先跑 --uia-walk 看看这棵树里有什么。", code=1)
+    if args.uia_index >= len(res.elements) or args.uia_index < 0:
+        msg = [f"匹配到 {len(res.elements)} 个元素，--uia-index {args.uia_index} 越界"]
+        msg += [f"  [{i}] {e.control_type} 「{e.name[:40]}」 {e.screen_center}"
+                for i, e in enumerate(res.elements[:8])]
+        raise AppError("\n".join(msg))
+
+    el = res.elements[args.uia_index]
+    client = el.center_in_client(hwnd)
+    if client is None:
+        raise AppError(
+            f"元素「{el.name}」没有可用的边界矩形（rect={el.rect}），无法解析坐标。"
+            "它可能离屏或已被虚拟化 —— 先把窗口滚到它可见再试。", code=1)
+
+    cw, ch = target_info["client_size"]
+    if not (0 <= client[0] < cw and 0 <= client[1] < ch):
+        print(f"警告：元素中心换算到客户区 {client} 落在 {cw}x{ch} 之外，"
+              f"这个点击多半不会命中。", file=sys.stderr)
+
+    if args.dry_run:
+        rec = {"ok": True, "dry_run": True, "element": el.to_dict(hwnd),
+               "screen_point": el.screen_center,
+               "client_point": client,
+               "client_size": [cw, ch], **meta}
+        print(json.dumps(rec, ensure_ascii=False, indent=2) if args.json
+              else f"将点击元素「{el.name}」（{el.control_type}）"
+                   f"客户区坐标 {client}（dry-run，未发消息）")
+        return 0
+
+    # ★ 复用原有通道：把 UIA 解析出的坐标喂给同一套点击逻辑，
+    #   所以「不抢光标」这个性质完全保留。
+    click_args = argparse.Namespace(
+        button=args.button, method=args.method, deep=args.deep,
+        restore_cursor=args.restore_cursor,
+    )
+    hier = probe_hierarchy(hwnd, client[0], client[1])
+    if args.deep and args.method not in ("hardware", "sendinput"):
+        rec = resolving_click(hwnd, client[0], client[1], click_args)
+    else:
+        rec = do_click(hwnd, client[0], client[1], click_args)
+        rec.setdefault("hierarchy", [hex(hwnd)])
+
+    rec.update({
+        "element": el.to_dict(hwnd),
+        "client_point": client,
+        "uia_matched": len(res.elements),
+        "uia_index": args.uia_index,
+        "uia_truncated": res.truncated,
+        "base_pos": list(client),
+        "client_size": [cw, ch],
+        "button": args.button,
+        "method": args.method,
+        "count": 1,
+        "index": 0,
+        "dry_run": False,
+    })
+
+    if args.json:
+        print(json.dumps(rec, ensure_ascii=False))
+    elif rec["ok"]:
+        hit = rec["hwnd"]
+        extra = f" -> 子窗口 {hex(hit)}" if hit != hwnd else ""
+        print(f"已点击元素「{el.name}」（{el.control_type}）"
+              f"客户区坐标 {client}{extra}")
+        print("注意：UIA 找到了元素 ≠ 程序一定响应了这个点击 —— "
+              "要确认的话截个图看看界面变了没。")
+    else:
+        print(f"投递失败！{describe_error(rec['error'])}", file=sys.stderr)
+        return 4 if rec["error"] == ERROR_ACCESS_DENIED else 5
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     args = build_parser().parse_args(argv)
@@ -856,6 +1051,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             code = cmd_doctor(args)
         elif args.shot:
             code = cmd_shot(args)
+        elif args.uia_walk or args.uia_find or args.uia_click:
+            code = cmd_uia(args)
         elif args.swipe or args.scroll is not None:
             code = cmd_swipe(args)
         elif (not argv and args.hwnd is None and not args.title and not args.process

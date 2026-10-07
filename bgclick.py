@@ -62,6 +62,24 @@ bgclick.py —— Windows 后台窗口点击器（纯消息投递，不抢光标
    ★ 滑动不是「发一条消息」：拖动靠连续 WM_MOUSEMOVE 累积，所以默认按 30 步
      插值走过去。步数少 = 程序判成 0 距离；步数多 = 慢，但更像人手。
 
+UIA 元素查询（新增）
+--------------------
+   坐标原来得靠截图数像素，现在可以按元素名字直接问：
+
+     python bgclick.py --title "记事本" --uia-walk                     # 看整棵树
+     python bgclick.py --title "记事本" --uia-find --uia-name "保存"    # 只查不点
+     python bgclick.py --title "记事本" --uia-click --uia-name "保存"   # 查到就用它点
+
+   实现全在 bgkit/bgclick/uia.py，**纯 ctypes，不装 comtypes / uiautomation 包**。
+   UIA 的接口是平铺 vtable 的经典 COM，手写十来个真正要用的槽位就够，
+   不必为此破坏本项目「零依赖」的原则。槽位是实测认领的（见 uia.py 顶部表格）。
+
+   ★ 三条要记住的：
+     - UIA 找到元素 ≠ 程序响应了点击 —— 投递成功只代表消息进了队列，点完截图看。
+     - 元素超过 --uia-limit（默认 500）时返回**部分结果**并标注 truncated，不是报错。
+       UIA 碰上几千行的列表会把目标程序卡住，这个上限必须留着。
+     - 所有 UIA 调用固定在一条专用 STA 线程里跑 —— 多线程各自 CoInitialize 会死锁。
+
 权限（重要！）
 --------------
 Windows 的 UIPI（用户界面特权隔离）规则：**只有完整性级别(IL) >= 目标 IL 的进程，

@@ -84,12 +84,17 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         if u.path == "/health":
             # health 不需要 token（方便探活），但也不泄露任何敏感信息
+            try:
+                uia_ok, uia_msg = bc.uia.uia_available()
+            except Exception as e:      # noqa: BLE001 —— 探活绝不能因为 UIA 挂掉而失败
+                uia_ok, uia_msg = False, f"{type(e).__name__}: {e}"
             self._send(200, {
                 "ok": True, "service": "bgserver", "version": VERSION,
                 "elevated": bc.is_admin(),
                 "integrity": bc.integrity_name(bc.self_integrity()),
                 "pid": os.getpid(), "uptime": round(time.time() - self.server.started, 1),
                 "needs_token": True,
+                "uia": {"available": uia_ok, "message": uia_msg},
             })
             return
         if not self._authed():
@@ -99,6 +104,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_windows(q)
             elif u.path == "/window":
                 self._handle_window(q)
+            elif u.path == "/uia":
+                self._handle_uia_get(q)
             elif u.path == "/shutdown":
                 self._send(200, {"ok": True, "message": "服务正在退出"})
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
@@ -128,6 +135,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_key(body)
             elif u.path == "/mouse":
                 self._handle_mouse(body)
+            elif u.path == "/uia":
+                self._handle_uia(body)
             elif u.path == "/window":
                 # 客户端用 POST 发目标信息（和 click/shot 保持一致），
                 # 所以这里也要收 POST —— 只注册 GET 会让它 404。
@@ -184,6 +193,121 @@ class Handler(BaseHTTPRequestHandler):
         target["self_integrity"] = bc.integrity_name(bc.self_integrity())
         target["target_integrity"] = bc.integrity_name(bc.process_integrity(target["pid"]))
         self._send(200, {"ok": True, "window": target})
+
+    def _uia_query(self, body: dict, hwnd: int) -> dict:
+        """UIA 查询的公共部分：解析参数、遍历、返回结果。
+
+        为什么不用 FindAll 直接带条件去 UIA 里筛：一次遍历能同时服务
+        「枚举」「按名找」「按类型找」三种需求，也避开了 CreatePropertyCondition
+        的 VARIANT 入参。limit 内的元素量做 Python 侧筛选完全够快。
+        """
+        uiamod = bc.uia
+        ok, why = uiamod.uia_available()
+        if not ok:
+            raise bc.AppError(f"UI Automation 不可用：{why}", code=2)
+
+        max_depth = clamp_int(body.get("max_depth"), 1, 64, "max_depth", 12)
+        limit = clamp_int(body.get("limit"), 1, 5000, "limit", 500)
+        interactive_only = bool(body.get("interactive_only"))
+
+        name = body.get("name")
+        ctype = body.get("control_type")
+        auto_id = body.get("automation_id")
+        cls = body.get("class_name")
+        exact = bool(body.get("name_exact"))
+        for label, val in (("name", name), ("control_type", ctype),
+                           ("automation_id", auto_id), ("class_name", cls)):
+            if val is not None and not isinstance(val, str):
+                raise bc.AppError(f"{label} 必须是字符串", code=2)
+            if isinstance(val, str) and len(val) > 512:
+                raise bc.AppError(f"{label} 过长（上限 512 字符）", code=2)
+
+        if any((name, ctype, auto_id, cls)):
+            res = uiamod.find(hwnd, name=name, control_type=ctype,
+                              automation_id=auto_id, class_name=cls,
+                              exact=exact, interactive_only=interactive_only,
+                              max_depth=max_depth, limit=limit)
+        else:
+            res = uiamod.walk(hwnd, max_depth=max_depth, limit=limit,
+                              interactive_only=interactive_only)
+
+        payload = {
+            "hwnd": hex(hwnd),
+            "count": len(res.elements),
+            "truncated": res.truncated,
+            "limit": res.limit,
+            "visited": res.visited,
+            "max_depth": res.max_depth,
+            "elapsed": res.elapsed,
+            "failed_reason": res.failed_reason,
+            "elements": [e.to_dict(hwnd) for e in res.elements],
+        }
+        return payload
+
+    def _handle_uia(self, body: dict) -> None:
+        """
+        POST /uia —— UI Automation 元素查询。
+
+        用系统自带的 UIA 读窗口里的元素树，按名字/控件类型/AutomationId 查元素，
+        返回每个元素的**屏幕坐标和客户区坐标**。解决「坐标要靠截图数像素」这个
+        老问题：先查元素拿坐标，再把坐标交给 /click 去点（那条路仍然不抢光标）。
+
+        请求体：
+            {"title": "记事本"}                              查什么窗口（照旧的目标字段）
+            {"name": "确定", "control_type": "Button"}        查找条件（都可选，至少给一个才有意义）
+            {"max_depth": 12, "limit": 500}                  遍历边界
+            {"interactive_only": true}                       只要疑似可交互的元素
+
+        不给任何查找条件时 = 遍历整棵树（等价于 --uia-walk）。
+
+        ★ 关于 limit：超了就返回**部分结果**并置 truncated=true，不是报错。
+          UIA 碰上几千行的列表会把目标程序卡住，所以必须有上限。
+
+        ★ 关于坐标：elements[].rect 是 [left, top, right, bottom] 的**屏幕坐标**，
+          client_center 已经换算成该窗口的**客户区坐标** —— 直接喂给 /click 的
+          pos 字段即可。
+        """
+        target = find_target(body)
+        payload = self._uia_query(body, target["hwnd"])
+        payload.update({"title": target["title"], "process": target["process"]})
+        self._send(200, {"ok": True, "uia": payload})
+
+    def _handle_uia_get(self, q: dict) -> None:
+        """GET /uia?title=xxx&name=yyy —— 和 POST 版等价，方便快速试。"""
+        def one(key, default=None):
+            v = q.get(key)
+            return v[0] if v else default
+
+        body: dict = {}
+        for key in ("title", "process", "name", "control_type",
+                    "automation_id", "class_name"):
+            v = one(key)
+            if v:
+                body[key] = v
+        if one("hwnd"):
+            body["hwnd"] = int(one("hwnd"), 0)
+
+        def as_int(key, default):
+            v = one(key)
+            if not v:
+                return default
+            try:
+                return int(v)
+            except ValueError:
+                raise bc.AppError(f"{key} 必须是整数，收到 {v!r}", code=2)
+
+        body["max_depth"] = as_int("max_depth", 12)
+        body["limit"] = as_int("limit", 500)
+        # 注意用 name_exact 而不是 exact：exact 在 find_target 里是「标题完全匹配」
+        for flag in ("interactive_only", "name_exact"):
+            v = one(flag)
+            if v is not None:
+                body[flag] = str(v).lower() in ("1", "true", "yes", "on")
+
+        target = find_target(body)
+        payload = self._uia_query(body, target["hwnd"])
+        payload.update({"title": target["title"], "process": target["process"]})
+        self._send(200, {"ok": True, "uia": payload})
 
     def _handle_click(self, body: dict) -> None:
         target = find_target(body)

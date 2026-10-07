@@ -102,5 +102,8 @@ class Client:
     def mouse(self, **kw) -> dict:
         return self._request("POST", "/mouse", kw)
 
+    def uia(self, **kw) -> dict:
+        return self._request("POST", "/uia", kw)
+
     def shutdown(self) -> dict:
         return self._request("GET", "/shutdown")

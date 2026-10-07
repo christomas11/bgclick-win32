@@ -217,6 +217,22 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-restore-cursor", dest="restore_cursor", action="store_false",
                     default=True, help="hardware/sendinput 模式结束后不把光标放回原处")
 
+    sp = add("uia", "UIA 元素查询（按名字/类型找元素并拿坐标）")
+    add_target_args(sp)
+    sp.add_argument("--name", help="元素名（默认子串匹配，不区分大小写）")
+    sp.add_argument("--type", help="控件类型，如 Button / Edit / MenuItem")
+    sp.add_argument("--automation-id", help="按 AutomationId 匹配（子串）")
+    sp.add_argument("--class-name", help="按 ClassName 匹配（子串）")
+    # 注意：不能用 --exact —— add_target_args 已经把它注册成「标题完全匹配」了，
+    # 重复注册会让 argparse 抛 conflicting option string。所以这里另起一个名字。
+    sp.add_argument("--name-exact", action="store_true",
+                    help="--name 改为完全匹配（区别于 --exact，后者管的是标题）")
+    sp.add_argument("--interactive-only", action="store_true",
+                    help="只保留疑似可交互的元素")
+    sp.add_argument("--max-depth", type=int, default=12, help="遍历深度上限（默认 12）")
+    sp.add_argument("--limit", type=int, default=500,
+                    help="最多采集多少元素（默认 500；超了返回部分结果并标注截断）")
+
     return p
 
 
@@ -403,6 +419,47 @@ def main(argv: list[str] | None = None) -> int:
                              f"{m.get('from')} → {m.get('to')}，"
                              f"{m.get('steps')} 步 / {m.get('sent')} 条消息"
                              f"（目标 {m.get('title')}）")
+            return emit(r, as_json, human)
+
+        if args.cmd == "uia":
+            body = target_payload(args)
+            body.update({"max_depth": args.max_depth, "limit": args.limit})
+            if args.name:
+                body["name"] = args.name
+            if args.type:
+                body["control_type"] = args.type
+            if args.automation_id:
+                body["automation_id"] = args.automation_id
+            if args.class_name:
+                body["class_name"] = args.class_name
+            if args.name_exact:
+                body["name_exact"] = True
+            if args.interactive_only:
+                body["interactive_only"] = True
+            r = client.uia(**body)
+            human = None
+            if r.get("ok"):
+                u = r.get("uia", {})
+                lines = [f"读到 {u.get('count', 0)} 个元素"
+                         f"（visited={u.get('visited')}，最深 {u.get('max_depth')} 层，"
+                         f"{u.get('elapsed')}s）"]
+                if u.get("truncated"):
+                    lines.append(f"★ 已达采集上限 {u.get('limit')}，结果是部分内容")
+                if u.get("failed_reason"):
+                    lines.append(f"注意：{u['failed_reason']}")
+                els = u.get("elements", [])
+                for i, e in enumerate(els[:60]):
+                    lines.append(
+                        f"  [{i}] {str(e.get('control_type', '')).lower():<14}"
+                        f"屏幕 {str(e.get('center')):<14}"
+                        f"客户区 {str(e.get('client_center')):<14}"
+                        f"\"{str(e.get('name', ''))[:40]}\""
+                        + ("  [可交互]" if e.get("is_interactive") else "")
+                    )
+                if len(els) > 60:
+                    lines.append(f"  ... 还有 {len(els) - 60} 个，"
+                                 f"加 --type / --name 缩小范围")
+                human = "\n".join(lines)
             return emit(r, as_json, human)
 
         return 1
