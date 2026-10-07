@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """bgkit.bgserver.singleton.py —— 单实例锁与「已有实例」探测
 
-从 窗口工作.py 拆出的一节（源文件第 1015-1065 行）。只做代码搬运，逻辑未改。
+从最初的单文件脚本拆出的一节。只做代码搬运，逻辑未改。
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """bgkit.bgserver.logfile.py —— 日志（无窗口 exe 下看不到 stdout，所以必须落盘）
 
-从 窗口工作.py 拆出的一节（源文件第 970-1014 行）。只做代码搬运，逻辑未改。
+从最初的单文件脚本拆出的一节。只做代码搬运，逻辑未改。
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """bgkit.bgserver.bootstrap.py —— 提权重启、致命错误弹窗、早期日志位置
 
-从 窗口工作.py 拆出的一节（源文件第 886-933, 1066-1110 行）。只做代码搬运，逻辑未改。
+从最初的单文件脚本拆出的一节。只做代码搬运，逻辑未改。
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ def relaunch_elevated(argv: list[str]) -> int:
         #   而 console=False 的 exe 看不到任何输出，表现就是「UAC 点完就闪退」。
         params = subprocess.list2cmdline(elevation_argv(argv))
     else:
-        script = entry_script("bgserver.py", "窗口工作.py")
+        script = entry_script("bgserver.py")
         params = subprocess.list2cmdline([script] + elevation_argv(argv))
     print("正在申请管理员权限…… 屏幕上会弹 UAC，请点「是」。")
     try:

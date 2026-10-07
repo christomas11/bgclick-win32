@@ -18,8 +18,8 @@ def entry_script(*candidates: str) -> str:
     """
     在项目根目录里找一个入口脚本，返回绝对路径。
 
-    candidates 按优先级给：例如 ("bgserver.py", "窗口工作.py") —— 部署环境里
-    叫 bgserver.py，本仓库里叫 窗口工作.py，两个都认。
+    candidates 按优先级给：例如 ("bgserver.py",) —— 部署环境里可能改了名，
+    按顺序试一遍，都不在就返回第一个。
     """
     for name in candidates:
         path = os.path.join(ROOT, name)

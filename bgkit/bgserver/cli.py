@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """bgkit.bgserver.cli.py —— 命令行与主流程
 
-从 窗口工作.py 拆出的一节（源文件第 934-969, 1111-1465 行）。只做代码搬运，逻辑未改。
+从最初的单文件脚本拆出的一节。只做代码搬运，逻辑未改。
 """
 
 from __future__ import annotations
@@ -301,7 +301,7 @@ def _main_inner(args, argv: list[str]) -> int:
             if getattr(sys, "frozen", False):
                 cmd = [exe] + clean_argv
             else:
-                cmd = [exe, entry_script("bgserver.py", "窗口工作.py")] + clean_argv
+                cmd = [exe, entry_script("bgserver.py")] + clean_argv
 
             log.write(f"拉起新实例：{subprocess.list2cmdline(cmd)}")
             subprocess.Popen(cmd, cwd=launch_cwd, close_fds=True)

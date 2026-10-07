@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """bgkit.bgserver.security.py —— 参数校验与安全助手
 
-从 窗口工作.py 拆出的一节（源文件第 208-366 行）。只做代码搬运，逻辑未改。
+从最初的单文件脚本拆出的一节。只做代码搬运，逻辑未改。
 """
 
 from __future__ import annotations

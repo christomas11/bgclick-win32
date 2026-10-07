@@ -96,7 +96,7 @@ bgserver.py —— 后台点击/截图的常驻本地服务（供 agent skill �
 # 兼容壳：真正的实现已经拆到 bgkit/bgserver/ 下面了。
 # 这个文件保留原来的名字和用法，老的调用一律不用改：
 #     import bgserver as bc        →  bc.user32 / bc.match_windows / ...
-#     python 窗口工作.py --list       →  命令行照旧
+#     python bgserver.py --list       →  命令行照旧
 # ========================================================================
 
 from bgkit.bgserver import *  # noqa: F401,F403

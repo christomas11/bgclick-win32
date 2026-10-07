@@ -51,7 +51,7 @@ def ensure_server(host: str = DEFAULT_HOST, port: int | None = None,
         raise ConnectionError(
             f"服务没有运行（{host}:{port}）。启动它：python bgserver.py")
 
-    server_py = root_file("bgserver.py", "窗口工作.py")
+    server_py = root_file("bgserver.py")
     if not os.path.exists(server_py):
         raise ConnectionError(f"找不到 {server_py}")
 

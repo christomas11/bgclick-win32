@@ -7,6 +7,11 @@ venv/
 __pycache__/
 *.py[cod]
 
+# PyInstaller 产物（build/ 是中间垃圾，dist/ 是打包结果，都不入库）
+build/
+dist/
+*.manifest
+
 # 截图产物
 shots/
 
