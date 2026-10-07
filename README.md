@@ -7,7 +7,10 @@
 
 纯标准库，**零第三方依赖**（PNG 编码都是自己拿 zlib 写的）。Python 3.8+，实测 3.12.4。
 
-> 当前版本 **v1.4.0**。
+> 当前版本 **v1.5.0**。
+>
+> - 想用 AI agent 驱动它？看 [`AGENTS.md`](AGENTS.md) —— 给 agent 的操作手册。
+> - 命令速查看 [`docs/常用指令.md`](docs/常用指令.md)。
 
 ---
 
@@ -29,6 +32,7 @@
 | 鼠标滑动 / 拖拽 / 滚轮 | ✅ 插值成串 `WM_MOUSEMOVE` | ✅ `hardware` / `sendinput` |
 | 文本输入（中文 / emoji） | ✅ `WM_CHAR` 通路 | — |
 | 截图 | ✅ `PrintWindow`，遮挡也能抓 | — |
+| **元素查询（UIA）** | ✅ 按名字/类型查元素、直接拿坐标 | — |
 
 ---
 
@@ -237,7 +241,64 @@ python bgclient.py mouse --title "记事本" --scroll -5
 
 ---
 
-## 三、HTTP API
+## 三、UIA 元素查询：按元素名拿坐标，不用数像素
+
+**v1.5.0 新增。** 老办法是截图 → 用眼睛量像素 → 换算客户区坐标，又慢又不准。
+现在可以用系统自带的 **UI Automation** 读窗口里的元素树，按名字/控件类型找元素，
+直接拿到坐标。
+
+```bash
+# 看元素树（默认只读，不会误触）
+python bgclient.py uia --title "QQ"
+python bgclient.py uia --title "QQ" --interactive-only     # 只要能点的
+
+# 按条件查
+python bgclient.py uia --title "QQ" --name "发送"           # 元素名（子串，不分大小写）
+python bgclient.py uia --title "QQ" --type Edit             # 控件类型
+python bgclient.py uia --title "QQ" --automation-id "okBtn"
+python bgclient.py uia --title "QQ" --name "发送" --name-exact
+```
+
+每个元素返回 `rect`（屏幕坐标）、`center`、**`client_center`（客户区坐标）** ——
+后者直接就是 `click --pos` 要的那个坐标系。查到坐标再交给 `click`，那条路依然不抢光标。
+
+```bash
+# 查到坐标 → 点它（两步都走消息投递，光标全程不动）
+python bgclient.py uia  --title "QQ" --name "发送"
+python bgclient.py click --title "QQ" --pos <client_center>
+```
+
+也可以不经服务直接用 `bgclick.py`（UIA 完全不依赖 bgserver）：
+
+```bash
+python bgclick.py --title "QQ" --uia-walk                  # 列元素树
+python bgclick.py --title "QQ" --uia-find --uia-name "发送"  # 只查不点
+python bgclick.py --title "QQ" --uia-click --uia-name "发送" # 查到就用它点
+```
+
+> **纯 ctypes 实现**，没用 `comtypes` / `uiautomation` 包 —— 依然是零第三方依赖。
+
+### 三条要记住的
+
+| 事实 | 说明 |
+|---|---|
+| **找到元素 ≠ 程序响应了点击** | 和 `--method post` 一回事：投递成功只代表消息进了队列。做不可逆动作前该截图还是得截。 |
+| **超限返回的是部分结果，不是报错** | 元素超过 `--limit`（默认 500）时置 `truncated=true` 并照常返回。UIA 碰上几千行的列表会把目标程序卡住，这个上限必须留着。 |
+| **默认只读** | `uia` / `--uia-find` 都是纯查询。只有 `--uia-click` 才真的点。 |
+
+### 已知限制（实测）
+
+* **Electron 程序（QQ NT / VS Code / Discord…）树很浅**：可能只有一堆嵌套 `pane`，
+  正文和按钮拿不到名字。**但 QQ 实测能拿到**：输入框是 `Edit`、发送按钮是 `Button`，
+  所以「Electron 一定不行」是错的 —— 先 `uia` 看一眼再下结论。
+* **树大时查询会慢**：QQ 完整树约 365 个节点、单次查询 3~4 秒。加 `--type` / `--name`
+  缩小范围**不会更快**（过滤发生在遍历之后），想快只能调小 `--max-depth`。
+* **`--limit` 小的时候会先拿到容器**：`pane` 占满预算，具名控件被挤出结果。
+  遇到「只有 pane」就调大 `--limit`，或者直接按名字查。
+
+---
+
+## 四、HTTP API
 
 基址 `http://127.0.0.1:8765`。除 `/health` 外都需要
 `Authorization: Bearer <token>`（token 在状态目录 `.bgclick/token.txt`）。
@@ -252,6 +313,7 @@ python bgclient.py mouse --title "记事本" --scroll -5
 | POST | `/click` | 点击（left / right / middle） |
 | POST | `/key` | **键盘**：`chord` / `chords` / `keys`(+`hold_seconds`) / `text` |
 | POST | `/mouse` | **鼠标**：`dx`/`dy`、`to`、`path`、`pattern`、`scroll`、`button`(拖拽) |
+| POST | `/uia` | **元素查询**：按 name / control_type / automation_id / class_name 找元素，拿坐标（v1.5.0） |
 | POST | `/screenshot` | 截图 |
 | POST | `/text` | 向窗口输入文本（逐字符 `WM_CHAR`） |
 
@@ -310,6 +372,35 @@ python bgclient.py mouse --title "记事本" --scroll -5
 * 坐标是**客户区坐标**；滚轮的 `lParam` 按 Windows 规定用屏幕坐标（库内部换算）。
 * `batch`（默认 true）只对 `sendinput` 有效：整批原子提交。
 
+**`/uia`**（元素查询，v1.5.0 新增）
+
+```json
+{ "title": "QQ" }
+{ "title": "QQ", "name": "发送" }
+{ "title": "QQ", "control_type": "Button", "interactive_only": true }
+{ "title": "QQ", "automation_id": "okBtn", "name_exact": true }
+{ "title": "QQ", "max_depth": 12, "limit": 500 }
+```
+
+查找条件 `name` / `control_type` / `automation_id` / `class_name` 都可选（至少给一个
+才有筛选意义），配 `name_exact` / `interactive_only` / `max_depth`（默认 12）/
+`limit`（默认 500）。**不给任何条件就是遍历整棵树**（等价于 `--uia-walk`）。
+GET 和 POST 都行，方便快速试。
+
+返回 `uia` 对象，含 `count`、`truncated`、`limit`、`visited`、`max_depth`、
+`elapsed`、`failed_reason` 和 `elements`。每个元素带：
+
+| 字段 | 说明 |
+|---|---|
+| `rect` | `[left, top, right, bottom]`，**屏幕坐标** |
+| `center` | 屏幕坐标中心点 |
+| **`client_center`** | **客户区坐标**中心点 —— 直接喂给 `/click` 的 `pos` |
+| `name` / `control_type` / `automation_id` / `class_name` | 元素标识 |
+| `is_interactive` | 是否疑似可交互 |
+
+> ★ `limit` 超了返回**部分结果**并置 `truncated=true`，不是报错 ——
+> UIA 碰上几千行的列表会把目标程序卡住，上限必须留着。
+
 **`/screenshot`**
 
 ```json
@@ -335,7 +426,7 @@ python bgclient.py mouse --title "记事本" --scroll -5
 
 ---
 
-## 四、安全设计（重要）
+## 五、安全设计（重要）
 
 这个服务跑在**管理员权限**下、还能模拟鼠标键盘，所以它本质上是一块**提权面**。
 下面每条限制都是刻意的：
@@ -355,7 +446,7 @@ python bgclient.py mouse --title "记事本" --scroll -5
 
 ---
 
-## 五、权限（UIPI）：点不动怎么办
+## 六、权限（UIPI）：点不动怎么办
 
 Windows 的 UIPI 规则：**只有完整性级别(IL) >= 目标 IL 的进程才能给目标窗口发消息**，
 低发高一律丢弃，`PostMessageW` 返回 `FALSE` + 错误码 5。
@@ -387,7 +478,7 @@ python bgclick.py --doctor --title "xxx" --pos 1,1   # 逐层探测卡在哪
 
 ---
 
-## 六、打包成 exe
+## 七、打包成 exe
 
 ```bash
 pip install pyinstaller
@@ -398,11 +489,14 @@ pyinstaller bgserver.spec --noconfirm
 ★ `_internal` 必须跟 exe 待在一起，别只搬 exe。
 
 不想自己打包的话，[Releases](https://github.com/christomas11/bgclick-win32/releases)
-里有打好的 `bgserver-v1.4.0-win64.zip`，解压即用。
+里有打好的 zip，解压即用。
+
+> ⚠️ 附件里的 exe 是 **v1.4.0** 构建的（不含 UIA）。要用 UIA 功能请自己打包，
+> 或直接跑源码 `python bgserver.py`。
 
 ---
 
-## 七、已知限制
+## 八、已知限制
 
 * **合成消息天生无效的目标**：DirectX / Vulkan 独占全屏游戏、用 Raw Input 自己读鼠标的软件、
   Chrome / Electron 的部分区域、无边框全屏窗口。
@@ -433,7 +527,7 @@ pyinstaller bgserver.spec --noconfirm
 
 ---
 
-## 八、项目结构
+## 九、项目结构
 
 ```
 bgclient.py            零依赖 CLI 客户端（兼容壳）
@@ -442,7 +536,7 @@ bgserver.py            常驻服务源码 / 打包入口（兼容壳）
 bgtray.py              托盘图标模块（兼容壳）
 
 bgkit/                 ★ 真正的实现
-  bgclick/             Win32 底层：win32 / mouse / keyinput / keys / keys /
+  bgclick/             Win32 底层：win32 / mouse / keyinput / keys /
                        sendinput / clicking / screen / uia / geometry /
                        targeting / wininfo / elevation / integrity / messaging
   bgclient/            HTTP 客户端、自动拉起、状态目录
@@ -460,12 +554,12 @@ docs/常用指令.md        命令速查
 
 ---
 
-## 九、环境与版本历史
+## 十、环境与版本历史
 
 * Windows（依赖 user32 / gdi32 / kernel32 / advapi32 / shell32）
 * Python 3.8+（实测 3.12.4）
 * **零第三方依赖** —— 只用标准库，PNG 编码也是自己写的（zlib）
-* 服务版本 **v1.4.0**（`python bgclient.py health` 可确认）
+* 服务版本 **v1.5.0**（`python bgclient.py health` 可确认）
 
 | 版本 | 新增 |
 |---|---|
@@ -474,10 +568,11 @@ docs/常用指令.md        命令速查
 | 1.2.0 | `/mouse` 滑动 / 拖拽 / 滚轮；`/key` 的 `--type` 字符不再翻倍 |
 | 1.3.0 | `--method hardware` 真输入（`SetCursorPos` + `mouse_event`） |
 | 1.4.0 | `--method sendinput`（系统输入队列、整批原子提交）；键盘扫描码路径 |
+| **1.5.0** | **UIA 元素查询**（`/uia`、`uia` 子命令、`--uia-*`）；`/health` 增加 `uia` 字段 |
 
 ---
 
-## 十、免责声明 / 使用边界
+## 十一、免责声明 / 使用边界
 
 这是**本机自动化工具**，跑在你自己的电脑上、操作你自己开的窗口。请遵守：
 

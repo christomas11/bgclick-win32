@@ -90,6 +90,18 @@ bgserver.py —— 后台点击/截图的常驻本地服务（供 agent skill �
      ★ 能力边界：SendInput 注入仍会被 Raw Input 识别（hDevice=NULL，
        低级钩子有 LLMHF_INJECTED）。要「像真实硬件」只能上驱动级虚拟 HID，
        不在本项目范围内。
+
+1.5.0 新增：
+ 12. /uia 接口 + `uia` 子命令 —— UI Automation 元素查询。用系统自带的 UIA 读窗口的
+     元素树，按 name / control_type / automation_id / class_name 找元素，
+     直接拿到 rect（屏幕坐标）和 client_center（客户区坐标）。
+     解决「坐标要靠截图数像素」这个老问题：先查元素拿坐标，再交给 /click 去点，
+     那条路仍然不抢光标。
+     * `limit`（默认 500）超了返回**部分结果**并置 truncated=true，不报错 ——
+       UIA 碰上几千行的列表会把目标程序卡住，上限必须留着。
+     * 默认只读：walk / find 都是纯查询，只有 `--uia-click` 才真的点。
+     * 纯 ctypes 实现，没用 comtypes / uiautomation 包。
+     * /health 里多一个 `uia: {available, message}`，一眼看出这个 build 有没有带 UIA。
 """
 
 # ========================================================================

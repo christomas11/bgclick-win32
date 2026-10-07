@@ -12,7 +12,7 @@ import tempfile
 from typing import Optional
 
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 DEFAULT_PORT = 8765
 
 # 允许截图落盘的根目录（启动时填充为绝对路径）
