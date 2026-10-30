@@ -22,7 +22,11 @@ shots/
 
 # 运行时状态与日志（正常状态目录在 %USERPROFILE%\.bgclick，这里兜底）
 .bgstate/
+bgclick-state/
 *.log
+
+# ★ 状态目录里含 token.txt —— 低完整性进程写不进 ~/.bgclick 时会落到当前目录，
+#   不忽略的话 token 会被一起提交上去。
 
 # 打包与测试产物
 *.egg-info/
