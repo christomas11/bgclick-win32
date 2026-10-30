@@ -42,9 +42,10 @@ jobs:
           bgtray --version
 
       - name: 验证 MCP 握手
-        run: |
-          python -c "import json,subprocess,sys; p=subprocess.run([sys.executable,'-m','bgkit.bgmcp'],input='{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n',capture_output=True,text=True,encoding='utf-8'); d=json.loads(p.stdout.strip().splitlines()[0]); print(d['result']['serverInfo']); assert d['result']['serverInfo']['name']=='bgclick'"
+        # 不写成 python -c：windows runner 用 pwsh 包一层，
+        # 内联的 \" 和 \n 会被 PowerShell 的引号解析吃掉（会报 SyntaxError）。
+        run: python tests/ci_mcp_handshake.py
 
       - name: 验证零第三方依赖
-        run: |
-          python -c "import importlib.metadata as m; reqs=m.requires('bgclick') or []; print('dependencies:', reqs); assert not reqs, '这个项目必须零依赖'"
+        # 全部保持 ASCII：带中文的 python -c 在 pwsh 下容易被转码破坏
+        run: python -c "import importlib.metadata as m, sys; r = m.requires('bgclick') or []; print('dependencies:', r); sys.exit(1 if r else 0)"
