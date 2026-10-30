@@ -1,11 +1,15 @@
 """CI 用：验证装好之后 `python -m bgkit.bgmcp` 能完成 MCP 握手并列出工具。
 
-为什么不直接写在 workflow 里用 `python -c`：GitHub Actions 的 windows runner
-用 pwsh 执行 run 步骤（命令是 `pwsh -command ". '{0}'"` 包一层），内联代码里的
-`\"` 和 `\n` 会被 PowerShell 的引号解析吃掉，Python 拿到的是被截断的字符串，
-直接 SyntaxError: unterminated string literal。实测 3.8 / 3.12 都栽在这一步。
+两个曾经踩过的坑，写在这里免得以后有人改回去：
 
-放成独立文件就没这问题，顺便能把校验写清楚。
+1. 不要写成 workflow 里的内联 `python -c`。GitHub Actions 的 windows runner
+   会先用一层 shell 包装命令，内联代码里的转义双引号和换行符会被这层
+   shell 的引号解析吃掉，Python 拿到的是被截断的字符串，直接
+   SyntaxError: unterminated string literal。
+
+2. 这个脚本里不要出现非 ASCII 字符。runner 的控制台编码是 cp1252，
+   print 中文会抛 UnicodeEncodeError: 'charmap' codec can't encode。
+   所以下面所有输出都是英文，并且开头会把 stdout 尽量切到 UTF-8 兜底。
 
 注意：文件名不是 test_*.py，pytest 不会收集它，只是给 CI 调用的脚本。
 """
@@ -16,6 +20,15 @@ import sys
 # 工具表里必须有这些 —— 少一个说明转发路由断了
 REQUIRED_TOOLS = ("click", "uia_tree", "wait_for", "screenshot", "list_windows")
 MIN_TOOLS = 10
+
+
+def _force_utf8_stdout() -> None:
+    """runner 的控制台可能是 cp1252，尽量切到 UTF-8；切不动就算了。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 
 def main() -> int:
@@ -40,14 +53,14 @@ def main() -> int:
     )
 
     if proc.returncode != 0:
-        print("[X] bgmcp 退出码 %s" % proc.returncode)
+        print("[X] bgmcp exited with code %s" % proc.returncode)
         print("--- stderr ---")
         print((proc.stderr or "")[:2000])
         return 1
 
     raw = [line for line in (proc.stdout or "").splitlines() if line.strip()]
     if not raw:
-        print("[X] stdout 是空的，MCP 没有回包")
+        print("[X] stdout is empty - MCP sent no reply")
         print("--- stderr ---")
         print((proc.stderr or "")[:2000])
         return 1
@@ -58,7 +71,7 @@ def main() -> int:
             msg = json.loads(line)
         except json.JSONDecodeError:
             # 协议流里混进一行非 JSON，客户端会直接断连，必须当失败
-            print("[X] 协议流里混入了非 JSON 内容: %r" % line[:200])
+            print("[X] non-JSON line leaked into the protocol stream: %r" % line[:200])
             return 1
         if "id" in msg:
             replies[msg["id"]] = msg
@@ -66,24 +79,25 @@ def main() -> int:
     info = (replies.get(1, {}).get("result") or {}).get("serverInfo") or {}
     print("serverInfo: %s" % (info,))
     if info.get("name") != "bgclick":
-        print("[X] 服务名不是 bgclick")
+        print("[X] serverInfo.name is not bgclick")
         return 1
 
     tools = ((replies.get(2, {}).get("result") or {}).get("tools")) or []
     names = [t.get("name") for t in tools]
-    print("工具 %d 个: %s" % (len(tools), ", ".join(n for n in names if n)))
+    print("tools: %d -> %s" % (len(tools), ", ".join(n for n in names if n)))
 
     if len(tools) < MIN_TOOLS:
-        print("[X] 工具数量不足，期望 >= %d" % MIN_TOOLS)
+        print("[X] expected at least %d tools" % MIN_TOOLS)
         return 1
     missing = [n for n in REQUIRED_TOOLS if n not in names]
     if missing:
-        print("[X] 缺少工具: %s" % ", ".join(missing))
+        print("[X] missing tools: %s" % ", ".join(missing))
         return 1
 
-    print("[OK] MCP 握手通过，%d 个工具" % len(tools))
+    print("[OK] MCP handshake passed with %d tools" % len(tools))
     return 0
 
 
 if __name__ == "__main__":
+    _force_utf8_stdout()
     sys.exit(main())
