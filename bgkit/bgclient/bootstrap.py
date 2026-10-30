@@ -22,13 +22,17 @@ from .paths import DEFAULT_HOST, read_port, state_dir
 # 自动拉起服务（让 skill 用起来像"一条命令"）
 # --------------------------------------------------------------------------
 
+# 探活必须直连：走系统代理的话会被代理挡成 502，
+# 于是「服务明明在跑」被判成没跑，反手再拉起一个实例。
+_PROBE = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 
 def _ping(host: str, port: int, timeout: float = 2.0) -> bool:
     """轻量探活，不需要 token。"""
     try:
         req = urllib.request.Request(f"http://{host}:{port}/health")
         req.add_header("Host", f"127.0.0.1:{port}")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _PROBE.open(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8")).get("ok") is True
     except Exception:
         return False

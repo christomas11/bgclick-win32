@@ -54,11 +54,16 @@ class SingleInstance:
 
 
 def find_existing(port: int) -> Optional[int]:
-    """端口上已有服务在跑就返回它的 pid，否则 None。"""
+    """端口上已有服务在跑就返回它的 pid，否则 None。
+
+    探活走直连不代理 —— 否则代理回 502 会被当成「没有实例」，
+    结果两个 bgserver 抢同一个端口。
+    """
     try:
         import urllib.request
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         req = urllib.request.Request(f"http://127.0.0.1:{port}/health")
-        with urllib.request.urlopen(req, timeout=2) as resp:
+        with opener.open(req, timeout=2) as resp:
             return json.loads(resp.read().decode("utf-8")).get("pid")
     except Exception:
         return None

@@ -17,6 +17,12 @@ from .paths import DEFAULT_HOST, TIMEOUT, read_port, read_token, state_dir
 # HTTP
 # --------------------------------------------------------------------------
 
+# 本机服务绝不能走系统代理。
+# 装了 Clash / v2ray / 公司代理的机器上，urllib 会默认把 127.0.0.1 也塞给代理，
+# 代理回一个 502，表面看像「服务没启动」，实际服务好好的 —— 排查起来极其浪费时间。
+# ProxyHandler({}) 表示「代理表为空」，也就是直连。
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 
 class Client:
     def __init__(self, host: str = DEFAULT_HOST, port: int | None = None,
@@ -39,7 +45,7 @@ class Client:
         if data is not None:
             req.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with _OPENER.open(req, timeout=self.timeout) as resp:
                 raw = resp.read().decode("utf-8", "replace")
                 return json.loads(raw) if raw.strip() else {}
         except urllib.error.HTTPError as e:
@@ -73,7 +79,7 @@ class Client:
         req = urllib.request.Request(self.base + "/health")
         req.add_header("Host", f"127.0.0.1:{self.port}")
         try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with _OPENER.open(req, timeout=5) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except Exception as e:
             raise ConnectionError(f"连不上 {self.base}（{e}）。服务没启动？") from e
