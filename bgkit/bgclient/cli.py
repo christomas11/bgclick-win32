@@ -126,10 +126,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = add("click", "点击")
     add_target_args(sp)
-    g = sp.add_mutually_exclusive_group(required=True)
+    g = sp.add_mutually_exclusive_group()
     g.add_argument("--pos", type=parse_pair, help="客户区坐标 X,Y")
     g.add_argument("--center", action="store_true", help="点客户区中心")
     g.add_argument("--screen-pos", type=parse_pair, help="屏幕绝对坐标 X,Y")
+    g.add_argument("--ref", metavar="@eN",
+                   help="UIA 元素编号（先跑 uia 扫描拿编号）。窗口挪了、缩放变了都不怕，"
+                        "比抄坐标稳；给了 --ref 就不用再指定窗口")
     sp.add_argument("--count", type=int, default=1, help="点击次数，0=循环（默认 1）")
     sp.add_argument("--interval", type=float, default=0.5, help="间隔秒（默认 0.5）")
     sp.add_argument("--button", default="left", choices=["left", "right", "middle"])
@@ -316,12 +319,19 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.cmd == "click":
             body = target_payload(args)
-            if args.pos:
+            if args.ref:
+                # 编号里自带窗口，服务端会自己解析出 hwnd + 坐标。
+                # 这里不能顺手塞 pos，否则会盖掉编号算出来的位置。
+                body["ref"] = args.ref
+            elif args.pos:
                 body["pos"] = args.pos
             elif args.center:
                 body["center"] = True
-            else:
+            elif args.screen_pos:
                 body["screen_pos"] = args.screen_pos
+            else:
+                raise SystemExit(
+                    "必须指定 --pos / --center / --screen-pos / --ref 之一（-h 看帮助）")
             body.update({"count": args.count, "interval": args.interval,
                          "button": args.button, "method": args.method,
                          "jitter": args.jitter, "activate": args.activate,

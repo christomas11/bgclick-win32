@@ -144,16 +144,37 @@ TOOLS: list[dict] = [
     ),
     _t(
         "mouse",
-        "鼠标滑动 / 拖拽 / 滚轮。默认插值成一串 WM_MOUSEMOVE 后台投递，不动光标。",
+        "鼠标滑动 / 拖拽 / 滚轮。默认插值成一串 WM_MOUSEMOVE 后台投递，不动光标。"
+        "下面五种玩法一次只用一种："
+        "① dx/dy 相对滑动 ② to 滑到某点 ③ path 走途经点 "
+        "④ pattern+distance 画手势 ⑤ scroll 滚轮。"
+        "加 button 就是按住拖动（配合 from/dy 拖滑块）。",
         _TARGET_PROPS,
         extra={
-            "mode": {"type": "string", "enum": ["swipe", "drag", "wheel"]},
+            "dx": {"type": "integer", "description": "相对滑动 X（正右负左）"},
+            "dy": {"type": "integer", "description": "相对滑动 Y（正下负上，注意屏幕 Y 向下为正）"},
+            "to": {"type": "array", "items": {"type": "integer"},
+                   "description": "滑到客户区某点 [x,y]"},
             "path": {"type": "array", "items": {"type": "array", "items": {"type": "integer"}},
                      "description": "途经点 [[x,y],[x,y]...]，客户区坐标"},
-            "from": {"type": "array", "items": {"type": "integer"}},
-            "to": {"type": "array", "items": {"type": "integer"}},
-            "delta": {"type": "integer", "description": "滚轮格数，正上负下"},
-            "method": {"type": "string", "enum": ["post", "send", "sendinput", "hardware"]},
+            "pattern": {"type": "string",
+                        "enum": ["line", "up", "down", "left", "right",
+                                 "circle", "square", "zigzag"],
+                        "description": "手势轨迹，配合 distance"},
+            "distance": {"type": "integer", "description": "手势尺寸（像素），默认 200"},
+            "scroll": {"type": "integer", "description": "滚轮格数，正上负下"},
+            "axis": {"type": "string", "enum": ["vertical", "horizontal"],
+                     "description": "滚轮方向轴，默认 vertical"},
+            "from": {"type": "array", "items": {"type": "integer"},
+                     "description": "拖动起点 [x,y]"},
+            "button": {"type": "string", "enum": ["left", "right", "middle"],
+                       "description": "给了就按住拖动（滑块/列表/画布用这个）"},
+            "steps": {"type": "integer", "description": "插值步数，默认 30（越大越平滑）"},
+            "delay": {"type": "number", "description": "每步间隔秒，默认按距离自动"},
+            "duration": {"type": "number", "description": "整段时长秒（要「拖 1 秒」这类需求用）"},
+            "method": {"type": "string", "enum": ["post", "send", "hardware"],
+                       "description": "post/send 后台投递不动光标；"
+                                      "hardware 是真输入，会占用真实光标，但对自绘 UI 才有效"},
         },
     ),
     _t(
@@ -199,6 +220,30 @@ _ROUTES = {
     "mouse": ("POST", "/mouse"),
     "uia_tree": ("POST", "/uia"),
 }
+
+
+def _normalize_args(name: str, args: dict) -> dict:
+    """
+    MCP 工具参数 → 服务端字段。
+
+    click 用 x/y 是为了让模型写起来自然（两个独立的整数），服务端只认 pos=[x,y]，
+    这里合并。只给一个的话宁可报错 —— 拿 x 去配一个猜出来的 y，点错位置的代价比报错大。
+    """
+    a = dict(args)
+    if name == "click":
+        x, y = a.pop("x", None), a.pop("y", None)
+        if x is not None or y is not None:
+            if x is None or y is None:
+                raise ValueError("click 的 x 和 y 必须同时给；也可以改用 pos / center / ref")
+            a.setdefault("pos", [int(x), int(y)])
+    elif name == "mouse":
+        # 旧字段名兼容：delta 是更早版本的滚轮参数
+        if "delta" in a and "scroll" not in a:
+            a["scroll"] = a.pop("delta")
+        else:
+            a.pop("delta", None)
+        a.pop("mode", None)      # 早期声明过但服务端从未实现，静默丢弃
+    return a
 
 
 def _dumps(obj: Any) -> str:
@@ -361,6 +406,11 @@ class McpServer:
             return _text_result(res, is_error=not res.get("ok", True))
         if name not in _ROUTES:
             return _text_result(f"未知工具：{name}", is_error=True)
+
+        try:
+            args = _normalize_args(name, args)
+        except (ValueError, TypeError) as e:
+            return _text_result(str(e), is_error=True)
 
         payload = self._tool_http(name, args)
 

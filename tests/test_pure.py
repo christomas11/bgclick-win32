@@ -267,3 +267,56 @@ class TestRefStore:
         refstore.save(0xDEADBEEF, refstore.assign([_FakeEl("a", [0, 0, 9, 9])], 0xDEADBEEF))
         with pytest.raises(refstore.RefError, match="已经不存在"):
             refstore.resolve("@e1", allow_stale=True)
+
+
+class TestMcpArgNormalize:
+    """MCP 工具参数 → 服务端字段。这类字段名对不上是最隐蔽的错：
+    工具不报错、服务端也不报错，只是参数被静默丢掉，最后点了错误的位置。"""
+
+    def test_click_xy_becomes_pos(self):
+        from bgkit.bgmcp.server import _normalize_args
+        out = _normalize_args("click", {"hwnd": "0x1", "x": 700, "y": 500})
+        assert out["pos"] == [700, 500]
+        assert "x" not in out and "y" not in out
+
+    def test_click_explicit_pos_wins(self):
+        from bgkit.bgmcp.server import _normalize_args
+        out = _normalize_args("click", {"pos": [1, 2], "x": 700, "y": 500})
+        assert out["pos"] == [1, 2]
+
+    def test_click_single_axis_is_rejected(self):
+        from bgkit.bgmcp.server import _normalize_args
+        with pytest.raises(ValueError, match="必须同时给"):
+            _normalize_args("click", {"x": 700})
+
+    def test_click_ref_untouched(self):
+        from bgkit.bgmcp.server import _normalize_args
+        out = _normalize_args("click", {"ref": "@e3"})
+        assert out == {"ref": "@e3"}
+
+    def test_mouse_delta_alias_to_scroll(self):
+        from bgkit.bgmcp.server import _normalize_args
+        out = _normalize_args("mouse", {"delta": -5})
+        assert out["scroll"] == -5
+        assert "delta" not in out
+
+    def test_mouse_scroll_not_overridden_by_delta(self):
+        from bgkit.bgmcp.server import _normalize_args
+        out = _normalize_args("mouse", {"scroll": 3, "delta": -5})
+        assert out["scroll"] == 3
+
+    def test_mouse_dead_mode_dropped(self):
+        from bgkit.bgmcp.server import _normalize_args
+        out = _normalize_args("mouse", {"mode": "wheel", "scroll": -2})
+        assert "mode" not in out
+        assert out["scroll"] == -2
+
+    def test_mouse_schema_matches_server_fields(self):
+        """schema 里声明的字段必须都是服务端真认的。"""
+        from bgkit.bgmcp.server import TOOLS
+        props = next(t for t in TOOLS if t["name"] == "mouse")["inputSchema"]["properties"]
+        for dead in ("delta", "mode"):
+            assert dead not in props, f"{dead} 服务端不认，不该出现在 schema 里"
+        for live in ("dx", "dy", "to", "path", "pattern", "distance",
+                     "scroll", "axis", "from", "button"):
+            assert live in props, f"{live} 是服务端真字段，schema 里缺了"
