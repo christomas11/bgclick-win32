@@ -37,12 +37,14 @@ bgclick = "bgkit.bgclick.cli:main"
 bgserver = "bgkit.bgserver.cli:main"
 bgclient = "bgkit.bgclient.cli:main"
 bgtray = "bgkit.bgtray.cli:main"
+bgmcp = "bgkit.bgmcp.server:main"
 
 [tool.setuptools]
 packages = [
     "bgkit",
     "bgkit.bgclick",
     "bgkit.bgclient",
+    "bgkit.bgmcp",
     "bgkit.bgserver",
     "bgkit.bgtray",
 ]

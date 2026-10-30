@@ -57,7 +57,9 @@ def ensure_server(host: str = DEFAULT_HOST, port: int | None = None,
 
     server_py = root_file("bgserver.py", "窗口工作.py")
     if not os.path.exists(server_py):
-        raise ConnectionError(f"找不到 {server_py}")
+        # pip 安装版根本不会有根目录脚本 —— 不能在这里失败，
+        # 下面会退回 python -m bgkit.bgserver
+        server_py = ""
 
     # 用 python.exe 而不是 pythonw —— 提权后的窗口要有控制台，用户才看得到进度
     exe = sys.executable
@@ -75,8 +77,10 @@ def ensure_server(host: str = DEFAULT_HOST, port: int | None = None,
     caller_cwd = os.getcwd()
     env = os.environ.copy()
     env["BGCLICK_STATE_DIR"] = state_dir()
-    args = [exe, server_py, "--port", str(port),
-            "--shot-dir", os.path.join(caller_cwd, "shots")]
+    # 开发树用脚本路径，pip 安装版退回 python -m bgkit.bgserver
+    head = [server_py] if server_py else ["-m", "bgkit.bgserver"]
+    args = [exe] + head + ["--port", str(port),
+                           "--shot-dir", os.path.join(caller_cwd, "shots")]
     try:
         subprocess.Popen(
             args, cwd=caller_cwd, env=env,
