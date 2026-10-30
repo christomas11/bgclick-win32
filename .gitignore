@@ -29,3 +29,7 @@ shots/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# PyInstaller 输出目录（dist/ 与 build/ 已在上面，这里补新旧两套命名）
+dist_new/
+build_new/

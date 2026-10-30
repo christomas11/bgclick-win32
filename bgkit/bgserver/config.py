@@ -12,7 +12,7 @@ import tempfile
 from typing import Optional
 
 
-VERSION = "1.6.0"
+VERSION = __import__("bgkit").__version__   # 单一来源，别在这里再写一遍
 DEFAULT_PORT = 8765
 
 # 允许截图落盘的根目录（启动时填充为绝对路径）
@@ -95,12 +95,24 @@ def load_or_create_token(explicit: Optional[str] = None) -> str:
         except Exception:
             pass
     t = secrets.token_urlsafe(32)
-    with open(p, "w", encoding="utf-8") as f:
-        f.write(t)
+    # ★ 写不进去也不能让服务起不来。
+    #   打包成无窗口 exe 之后，用户看不到任何报错，只看到「双击没反应」；
+    #   低完整性 / 只读用户目录 / 组策略都能让这一步失败，所以必须兜住。
     try:
-        os.chmod(p, 0o600)  # 仅当前用户可读写
-    except Exception:
-        pass
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(t)
+        try:
+            os.chmod(p, 0o600)  # 仅当前用户可读写
+        except Exception:
+            pass
+    except Exception as e:
+        import sys
+        sys.stderr.write(
+            f"[bgclick] token 写入失败（{type(e).__name__}: {e}）：{p}\n"
+            f"[bgclick] 本次改用临时 token，客户端读不到它会得到 401。\n"
+            f"[bgclick] 处理办法：用 --token 固定一个，或把 {os.path.dirname(p)} 设为可写。\n"
+        )
     return t
 
 
