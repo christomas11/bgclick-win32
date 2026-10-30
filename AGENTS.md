@@ -7,6 +7,17 @@
 这份文档是给**自动化 agent** 看的操作手册：怎么写命令、哪几条路不能自己走、
 卡住了按什么顺序排查、哪些坑已经踩过。人类用户看 [`README.md`](README.md)。
 
+> **三份文档怎么分工**
+>
+> | 文件 | 谁看 | 写什么 |
+> |---|---|---|
+> | `README.md` | 人 | 原理、安装、HTTP API、安全设计、版本历史 |
+> | `AGENTS.md`（本文） | agent | 完整操作手册：硬规则、踩坑记录、退出码 |
+> | `SKILL.md` | agent | 同一套内容压成 skill 形态，装进 skills 目录时用它 |
+>
+> 内容重叠是故意的 —— agent 只能读到被安装的那一份，不能指望它去翻仓库。
+> 代价是**改命令要改三处**（新增的 `@eN`、`--wait`、MCP 已经三份都写了）。
+
 > **路径变量**（下面的命令里按你机器的实际路径替换）：
 >
 > | 变量 | 含义 |
@@ -57,7 +68,7 @@ bgserver.spec           PyInstaller 打包配置
 > 都只是十来 KB 的**兼容壳**，真身在 `bgkit\` 里。只拷那几个 `.py` 会直接
 > `ModuleNotFoundError`。
 
-> **版本**：服务 v1.5.0（`/key` 键盘、`/mouse` 滑动、真输入方式、**UIA 元素查询**）。
+> **版本**：服务 v1.6.0（`/key`、`/mouse`、真输入方式、UIA 元素查询、`@eN` 编号、`--wait`）。
 > `python $BG health` 里除了 `version`，还会给 `uia: {available, message}` ——
 > 一眼看出这个 build 有没有带 UIA。旧 build 没这个字段，`uia` 子命令也会 404。
 
@@ -523,6 +534,42 @@ python $CLICK --title "QQ" --uia-click --uia-name "发送"  # 查到就用它点
 * **`--uia-limit` 小的时候会先拿到容器**：`pane` 占满预算，具名控件被挤出结果。
   遇到"只有 pane"就调大 `--limit` 或者直接按名字查。
 
+## 3.5 用编号点：`@e3`
+
+`uia` 扫完会给每个元素编号，编号与坐标一起存在 `%USERPROFILE%\.bgclick\refs.json`。
+之后直接按编号点，不用抄坐标 —— 窗口挪了、分辨率变了也不会点错。
+
+```powershell
+# 1) 扫一次，输出每行前面是 @e1 / @e2 ...
+python $CLICK --title "记事本" --uia-walk --uia-tree
+
+# 2) 按编号点（先 --dry-run 看一眼会打哪儿）
+python $CLICK --ref @e4 --dry-run
+python $CLICK --ref @e4
+```
+
+规则（踩过坑才写进来的）：
+
+- 只有**有矩形**的元素才分配编号，顺序 = 遍历顺序；同一界面重复扫描编号一般不变
+- 快照超过 1 小时默认拒用（`--allow-stale` 可以强用）
+- 窗口被关掉 / 编号不存在 → 明确报错并列出可用编号，**不会**静默点错位置
+- 坐标落到客户区之外时会自动重扫一次再试（元素可能移动了）
+
+> `bgclient.py` 侧：`/click` 的请求体可以直接写 `{"ref": "@e3"}`。
+> MCP 里是 `click(ref="@e3")`。
+
+## 4. 等待：别用 sleep 猜时间
+
+```powershell
+python $CLICK --wait --title "记事本" --timeout 10      # 等窗口出现
+python $CLICK --wait --process Notepad.exe --uia-type Document --timeout 5
+python $CLICK --wait --gone --title "记事本"            # 等它消失
+```
+
+- 成功退出码 `0`，超时 `6` —— 判退出码，别去解析输出文本
+- 轮询间隔用 `--interval`（默认 0.5s）
+- MCP 里有等价工具：`wait_for`
+
 ## 坐标怎么定（重要）
 
 > ★ **先试 UIA（上一节 §3），它不用截图。** 按元素名查一下就能拿到 `client_center`，
@@ -726,7 +773,7 @@ token 对不上，请求全 401（实测踩过）。
 基址 `http://127.0.0.1:8765`，除 `/health` 外都要
 `Authorization: Bearer <token>`。
 
-v1.5.0 的端点是：`/health`、`/windows`、`/window`、`/probe`、`/click`、
+v1.6.0 的端点是：`/health`、`/windows`、`/window`、`/probe`、`/click`、
 `/text`、**`/key`（键盘）**、**`/mouse`（滑动/拖拽/滚轮）**、`/screenshot`、
 **`/uia`（UIA 元素查询）**、`/shutdown`。
 

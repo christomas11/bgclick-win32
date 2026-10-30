@@ -7,10 +7,26 @@
 
 纯标准库，**零第三方依赖**（PNG 编码都是自己拿 zlib 写的）。Python 3.8+，实测 3.12.4。
 
-> 当前版本 **v1.5.0**。
+> 当前版本 **v1.6.0**。
 >
 > - 想用 AI agent 驱动它？看 [`AGENTS.md`](AGENTS.md) —— 给 agent 的操作手册。
+> - 想接 Claude Desktop / Cursor？看下面[「接入 MCP」](#接入-mcp五分钟)。
 > - 命令速查看 [`docs/常用指令.md`](docs/常用指令.md)。
+
+<!--
+演示区：这里应该放两张 GIF，比一千字都有用。
+
+  1. demo-background-click.gif
+     前半屏：记事本在前台打字；下半屏：另一个窗口的按钮被自动点中，
+     全程鼠标指针纹丝不动。
+  2. demo-printwindow.gif
+     一个窗口被别的窗口完全盖住，`bgclick shot` 依然抓到完整内容。
+
+录完放 docs/assets/ 下，把下面注释打开即可：
+
+![后台点击，光标不动](docs/assets/demo-background-click.gif)
+![遮挡下截图](docs/assets/demo-printwindow.gif)
+-->
 
 ---
 
@@ -22,7 +38,7 @@
 本项目的默认路径是**消息投递**：把 `WM_LBUTTONDOWN` / `WM_MOUSEMOVE` / `WM_KEYDOWN`
 直接塞进目标窗口的消息队列。光标不动、焦点不换，你可以同时用电脑。
 
-代价也很实在（见「[已知限制](#七已知限制)」）：位置类操作容易被程序识破。
+代价也很实在（见「[已知限制](#八已知限制)」）：位置类操作容易被程序识破。
 所以两条路都提供，按目标程序挑。
 
 | 能力 | 走消息投递（默认，不动光标） | 走真输入（占光标，前台行为） |
@@ -36,14 +52,39 @@
 
 ---
 
-## 快速开始
+## 安装
+
+### 装成命令（推荐）
+
+```bash
+pipx install git+https://github.com/christomas11/bgclick-win32
+# 或者
+uv tool install git+https://github.com/christomas11/bgclick-win32
+```
+
+装完多出五个命令：
+
+| 命令 | 干什么 |
+|---|---|
+| `bgclick` | 命令行主力：`--list` / `--scan` / `--click` / `--uia` / `--wait` |
+| `bgserver` | 常驻 HTTP 服务（只监听 127.0.0.1） |
+| `bgclient` | 服务客户端，输出 JSON，给脚本和 agent 用 |
+| `bgtray` | 托盘控制台 |
+| `bgmcp` | MCP server，给 Claude Desktop / Cursor 用 |
+
+> 目前还没发布到 PyPI，所以上面走的是 git 地址。发布后 `pipx install bgclick` 即可。
+
+### 或者不装，直接从源码跑
 
 ```bash
 git clone https://github.com/christomas11/bgclick-win32.git
 cd bgclick-win32
+python bgserver.py      # 起服务（会弹一次 UAC）
 ```
 
-不需要装任何东西，也不用 `pip install`。三个入口，别搞混：
+两种方式行为一致：装包走 `python -m bgkit.*`，源码走根目录那几个壳脚本。
+
+### 三个入口别搞混
 
 | 文件 | 角色 | 什么时候用 |
 |---|---|---|
@@ -68,11 +109,65 @@ python bgclient.py shutdown
 服务没起的时候 `bgclient.py` 会**自己拉起来**（会弹一次 UAC），
 所以上面这些命令其实可以直接跑。
 
+---
+
+## 接入 MCP（五分钟）
+
+任何支持 MCP 的客户端都能把它当工具调用。先装包，然后改客户端配置。
+
+`claude_desktop_config.json`（Windows 一般在
+`%APPDATA%\Claude\claude_desktop_config.json`）：
+
+```json
+{
+  "mcpServers": {
+    "bgclick": { "command": "bgmcp" }
+  }
+}
+```
+
+没装包、想直接指源码目录：
+
+```json
+{
+  "mcpServers": {
+    "bgclick": {
+      "command": "python",
+      "args": ["-m", "bgkit.bgmcp"],
+      "cwd": "D:\\path\\to\\bgclick-win32"
+    }
+  }
+}
+```
+
+重启客户端，工具列表里应该出现 10 个：
+
+| 工具 | 干什么 |
+|---|---|
+| `list_windows` | 列窗口 + 能否后台投递（先调它拿 `hwnd`） |
+| `uia_tree` | 读控件树，返回 `@e1` 这样的编号 |
+| `click` | 点击。给了 `ref: "@e3"` 就不用管坐标 |
+| `screenshot` | 截图；`inline=true` 直接把画面返回给模型看 |
+| `type_text` | 输入文本（中文、emoji 都行） |
+| `send_key` | 按键 / 组合键 / 多键同按 |
+| `mouse` | 滑动 / 拖拽 / 滚轮 |
+| `wait_for` | 等窗口或元素出现（也可等消失） |
+| `window_info` | 查单个窗口的完整性级别、被拦原因 |
+| `probe` | 投递探针：先确认这个窗口能不能点 |
+
+典型用法是三步：`list_windows` 拿句柄 → `uia_tree` 拿 `@eN` → `click(ref="@eN")`。
+坐标全程不出现在对话里，窗口挪了也不会点错。
+
+服务本身还是那个 `bgserver`：MCP 只是薄薄一层转发，第一次调用时会自动把它拉起来
+（会弹一次 UAC）。
+
+---
+
 > `bgkit/` 是真正的实现包，`bgclick.py` / `bgclient.py` / `bgserver.py` / `bgtray.py`
 > 只是十来 KB 的**兼容壳**（拆包前的老名字、老用法全部照旧）。
 > 只拷那几个 `.py` 会直接 `ModuleNotFoundError`。
 
-### 命令行速查
+## 命令行速查
 
 ```bash
 # 诊断：哪些窗口能点（✔/✘）、为什么点不动
@@ -84,6 +179,16 @@ python bgclick.py --doctor --title "记事本" --pos 1,1
 python bgclick.py --title "记事本" --pos 400,300 --count 3 --interval 1.0
 python bgclick.py --title "记事本" --center --count 0 --interval 5 --jitter 3
 python bgclick.py --title "记事本" --pos 400,300 --button right
+
+# 先扫元素拿编号，再按编号点（窗口挪了也不会点错）
+python bgclick.py --title "记事本" --uia-walk --uia-tree
+python bgclick.py --ref @e4
+python bgclick.py --ref @e4 --dry-run          # 只算不点，看看会打哪儿
+
+# 等条件成立（成功退出码 0，超时 6，可以直接 && 串）
+python bgclick.py --wait --title "记事本" --timeout 10
+python bgclick.py --wait --process Notepad.exe --uia-type Document --timeout 5
+python bgclick.py --wait --gone --title "记事本"
 
 # 滑动 / 拖拽 / 滚轮
 python bgclick.py --swipe --title "记事本" --delta 0,-500
@@ -530,8 +635,8 @@ pyinstaller bgserver.spec --noconfirm
 ## 九、项目结构
 
 ```
-bgclient.py            零依赖 CLI 客户端（兼容壳）
 bgclick.py             核心库 + 独立 CLI（兼容壳）
+bgclient.py            零依赖 CLI 客户端（兼容壳）
 bgserver.py            常驻服务源码 / 打包入口（兼容壳）
 bgtray.py              托盘图标模块（兼容壳）
 
@@ -539,13 +644,20 @@ bgkit/                 ★ 真正的实现
   bgclick/             Win32 底层：win32 / mouse / keyinput / keys /
                        sendinput / clicking / screen / uia / geometry /
                        targeting / wininfo / elevation / integrity / messaging
+                       + refstore（@eN 元素编号的存取与重扫）
   bgclient/            HTTP 客户端、自动拉起、状态目录
   bgserver/            HTTP API、安全（token / Host 校验 / 路径白名单）、
                        单实例锁、提权、日志、托盘
+  bgmcp/               MCP server（stdio JSON-RPC，零依赖）
   bgtray/              ctypes 托盘图标
+  assets/              随包分发的图标
 
+tests/                 65 个测试（纯函数 / MCP 协议 / 鉴权 / 记事本冒烟）
+.github/workflows/     Windows CI（3.8 + 3.12）
+pyproject.toml         打包配置（零依赖，五个命令入口）
 bgserver.spec          PyInstaller 打包配置
 SKILL.md               给 AI agent 用的操作手册（skill 形态）
+AGENTS.md              给 agent 的详细操作手册
 docs/常用指令.md        命令速查
 ```
 
@@ -559,7 +671,7 @@ docs/常用指令.md        命令速查
 * Windows（依赖 user32 / gdi32 / kernel32 / advapi32 / shell32）
 * Python 3.8+（实测 3.12.4）
 * **零第三方依赖** —— 只用标准库，PNG 编码也是自己写的（zlib）
-* 服务版本 **v1.5.0**（`python bgclient.py health` 可确认）
+* 服务版本 **v1.6.0**（`bgclick --version` 或 `bgclient health` 可确认）
 
 | 版本 | 新增 |
 |---|---|
@@ -568,7 +680,9 @@ docs/常用指令.md        命令速查
 | 1.2.0 | `/mouse` 滑动 / 拖拽 / 滚轮；`/key` 的 `--type` 字符不再翻倍 |
 | 1.3.0 | `--method hardware` 真输入（`SetCursorPos` + `mouse_event`） |
 | 1.4.0 | `--method sendinput`（系统输入队列、整批原子提交）；键盘扫描码路径 |
-| **1.5.0** | **UIA 元素查询**（`/uia`、`uia` 子命令、`--uia-*`）；`/health` 增加 `uia` 字段 |
+| 1.5.0 | UIA 元素查询（`/uia`、`uia` 子命令、`--uia-*`）；`/health` 增加 `uia` 字段 |
+| 1.6.0-WM_ACTIVATE | `--fake-activate`：先投 `WM_ACTIVATE` 假激活，对付「先查激活状态」的程序 |
+| **1.6.0** | **可 pip 安装**（五个命令入口）；**MCP server**（10 个工具）；<br>`--ref @eN` 元素编号；`--wait` 等待原语；<br>本机请求绕过系统代理；65 个测试 + Windows CI |
 
 ---
 

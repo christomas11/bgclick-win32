@@ -1,0 +1,6 @@
+* text=auto eol=lf
+
+# 二进制资源
+*.ico binary
+*.png binary
+*.exe binary
