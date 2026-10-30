@@ -23,26 +23,35 @@ pytestmark = pytest.mark.smoke
 WM_CHAR = 0x0102
 
 
-def _find_notepad(timeout: float = 15.0):
-    """轮询找记事本窗口，找不到返回 None（不抛异常，交给 skip）。"""
+def _find_notepad(timeout: float = 15.0, want_pid: int = 0):
+    """轮询找记事本窗口，找不到返回 None（不抛异常，交给 skip）。
+
+    给了 want_pid 就只认这个进程的窗口 —— 机器上本来开着记事本时，
+    光按进程名匹配会拿到别人的窗口，后面对它截图/打字就全乱了。
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             for hwnd in bc.iter_top_level_windows():
                 try:
-                    name = (bc.process_name(bc.window_pid(hwnd)) or "").lower()
+                    pid = bc.window_pid(hwnd)
+                    name = (bc.process_name(pid) or "").lower()
                 except Exception:
                     continue
-                if "notepad" in name:
-                    return hwnd
+                if "notepad" not in name:
+                    continue
+                if want_pid and pid != want_pid:
+                    continue
+                return hwnd
         except Exception:
             return None
         time.sleep(0.25)
     return None
 
 
-@pytest.fixture()
+@pytest.fixture(scope="module")
 def notepad():
+    """整个文件共用一个记事本窗口 —— 每条用例重开一次太慢，也没必要。"""
     if os.name != "nt":
         pytest.skip("仅 Windows")
     try:
@@ -53,7 +62,9 @@ def notepad():
     except Exception as e:
         pytest.skip(f"起不了记事本：{e}")
 
-    hwnd = _find_notepad()
+    # 先按 pid 找（自己起的那个），找不到再按进程名兜底：
+    # Win11 的 notepad.exe 是启动器，新进程可能被转交给已有实例，pid 对不上。
+    hwnd = _find_notepad(timeout=4, want_pid=proc.pid) or _find_notepad(timeout=8)
     if not hwnd:
         proc.terminate()
         pytest.skip("没等到记事本窗口（可能没有交互式桌面 session）")
@@ -98,10 +109,34 @@ class TestNotepadSmoke:
             sent += 1
         assert sent == len(text)
 
-    def test_screenshot_written(self, notepad, tmp_path):
-        out = tmp_path / "notepad.png"
+    def test_screenshot_written(self, notepad, tmp_path_factory):
+        out = tmp_path_factory.mktemp("shot") / "notepad.png"
         info = bc.save_screenshot(notepad, str(out))
         assert os.path.exists(info["path"]), info
         assert os.path.getsize(info["path"]) > 1000, "截图文件小得不像话"
         with open(info["path"], "rb") as f:
             assert f.read(8) == b"\x89PNG\r\n\x1a\n"
+
+
+class TestWait:
+    """--wait 的退出码是脚本串联的依据，不能错。"""
+
+    def test_returns_zero_when_window_exists(self, notepad):
+        from bgkit.bgclick.cli import build_parser, cmd_wait
+        args = build_parser().parse_args(
+            ["--wait", "--hwnd", hex(notepad), "--timeout", "3"])
+        assert cmd_wait(args) == 0
+
+    def test_times_out_with_code_6(self):
+        from bgkit.bgclick.cli import EXIT_WAIT_TIMEOUT, build_parser, cmd_wait
+        args = build_parser().parse_args(
+            ["--wait", "--title", "绝不存在的窗口zzz", "--timeout", "0.6",
+             "--interval", "0.1"])
+        assert cmd_wait(args) == EXIT_WAIT_TIMEOUT
+
+    def test_gone_returns_immediately_when_absent(self):
+        from bgkit.bgclick.cli import build_parser, cmd_wait
+        args = build_parser().parse_args(
+            ["--wait", "--gone", "--title", "绝不存在的窗口zzz",
+             "--timeout", "2", "--interval", "0.1"])
+        assert cmd_wait(args) == 0

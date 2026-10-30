@@ -173,6 +173,19 @@ TOOLS: list[dict] = [
             "limit": {"type": "integer", "description": "元素数量上限，默认 500"},
         },
     ),
+    _t(
+        "wait_for",
+        "等待窗口出现（或消失）。条件成立立刻返回，超时才报错 —— 比 sleep 一个"
+        "估摸的数字靠谱。适合「点了保存，等对话框弹出来」这种场景。",
+        _TARGET_PROPS,
+        extra={
+            "uia_name": {"type": "string", "description": "还要等这个元素出现"},
+            "control_type": {"type": "string", "description": "还要等这种控件出现"},
+            "gone": {"type": "boolean", "description": "true 表示等它消失而不是出现"},
+            "timeout": {"type": "number", "description": "超时秒数，默认 10"},
+            "interval": {"type": "number", "description": "轮询间隔秒数，默认 0.25"},
+        },
+    ),
 ]
 
 # 工具名 -> (HTTP 方法, 路径)
@@ -249,6 +262,86 @@ class McpServer:
                         "postable=false 的窗口后台投递会被 UIPI 拦，"
                         "改用 method=hardware 或 sendinput"}
 
+    def _wait_match(self, args: dict) -> tuple[bool, str]:
+        """查一次条件。窗口侧用 /windows，元素侧再打一次 /uia。"""
+        rows = self.client().windows().get("windows") or []
+
+        want_hwnd = args.get("hwnd")
+        if isinstance(want_hwnd, str):
+            try:
+                want_hwnd = int(want_hwnd, 0)
+            except ValueError:
+                want_hwnd = None
+        needle_t = (args.get("title") or "").lower()
+        needle_p = (args.get("process") or "").lower()
+
+        hits = []
+        for w in rows:
+            if want_hwnd is not None:
+                if w.get("hwnd") != want_hwnd:
+                    continue
+            elif needle_t:
+                if needle_t not in (w.get("title") or "").lower():
+                    continue
+            elif needle_p:
+                if needle_p != (w.get("process") or "").lower():
+                    continue
+            else:
+                continue            # 一个条件都没给，不算命中（防止瞬间返回）
+            hits.append(w)
+
+        if not hits:
+            return False, "窗口还没出现"
+
+        want_el = bool(args.get("uia_name") or args.get("control_type"))
+        if not want_el:
+            w = hits[0]
+            return True, f"{w.get('hwnd')} {w.get('process')} 「{w.get('title')}」"
+
+        for w in hits:
+            body: dict[str, Any] = {"hwnd": w.get("hwnd"), "limit": 800}
+            if args.get("uia_name"):
+                body["name"] = args["uia_name"]
+            if args.get("control_type"):
+                body["control_type"] = args["control_type"]
+            try:
+                uia = self.client().uia(**body).get("uia") or {}
+            except Exception:
+                continue
+            if uia.get("count"):
+                el = (uia.get("elements") or [{}])[0]
+                return True, (f"{w.get('hwnd')} 里的 {el.get('control_type')} "
+                              f"「{el.get('name')}」 {el.get('center')}")
+        return False, "窗口在，但没等到匹配的元素"
+
+    def _tool_wait_for(self, args: dict) -> dict:
+        import time
+        timeout = float(args.get("timeout") or 10.0)
+        interval = max(0.05, float(args.get("interval") or 0.25))
+        gone = bool(args.get("gone"))
+        started = time.time()
+        deadline = started + timeout      # 绝对时间戳，别拿 elapsed 来比
+        tries = 0
+        detail = ""
+
+        while True:
+            tries += 1
+            try:
+                hit, detail = self._wait_match(args)
+            except Exception as e:
+                hit, detail = False, f"检查出错：{type(e).__name__}: {e}"
+
+            satisfied = (not hit) if gone else hit
+            if satisfied:
+                return {"ok": True, "waited": round(time.time() - started, 2),
+                        "tries": tries, "detail": detail}
+            if time.time() >= deadline:
+                return {"ok": False, "timeout": True,
+                        "waited": round(time.time() - started, 2),
+                        "tries": tries,
+                        "detail": detail or "条件一直没成立"}
+            time.sleep(interval)
+
     def _tool_http(self, name: str, args: dict) -> dict:
         method, path = _ROUTES[name]
         c = self.client()
@@ -262,6 +355,10 @@ class McpServer:
     def call_tool(self, name: str, args: dict) -> dict:
         if name == "list_windows":
             return _text_result(self._tool_list_windows(args))
+        if name == "wait_for":
+            res = self._tool_wait_for(args)
+            # 超时要标成 isError，否则 agent 会以为等到了
+            return _text_result(res, is_error=not res.get("ok", True))
         if name not in _ROUTES:
             return _text_result(f"未知工具：{name}", is_error=True)
 

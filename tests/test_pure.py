@@ -148,7 +148,7 @@ class TestMcpToolTable:
     """MCP 工具表是给客户端看的契约，名字撞了或 schema 缺了都会让客户端直接罢工。"""
 
     def test_tool_count(self):
-        assert len(TOOLS) == 9
+        assert len(TOOLS) == 10
 
     def test_names_unique(self):
         names = [t["name"] for t in TOOLS]

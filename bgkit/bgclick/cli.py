@@ -37,6 +37,11 @@ from bgkit import __version__ as _bgkit_version
 # --------------------------------------------------------------------------
 
 
+# 退出码约定：0 成功 / 1 找不到窗口 / 2 参数错 / 3 窗口中途关闭
+#              4 权限被拒 / 5 投递失败 / 6 等待超时
+EXIT_WAIT_TIMEOUT = 6
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="bgclick.py",
@@ -173,6 +178,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="允许使用超过 1 小时的旧扫描快照")
     p.add_argument("--no-ref-save", action="store_true",
                    help="uia 扫描后不保存编号（不想留下状态文件时用）")
+
+    # ---- 等待（--wait）----
+    # agent 自动化的刚需：别用 sleep 猜时间，直接等条件成立。
+    p.add_argument("--wait", action="store_true",
+                   help="等窗口/元素出现（配合 --title / --process / --uia-*）")
+    p.add_argument("--gone", action="store_true",
+                   help="配合 --wait：反过来等它消失")
+    p.add_argument("--timeout", type=float, default=10.0,
+                   help="--wait 的超时秒数（默认 10）")
     return p
 
 
@@ -928,6 +942,94 @@ def cmd_shot(args) -> int:
     return 0
 
 
+def _wait_condition(args, want_uia: bool) -> tuple[bool, str]:
+    """检查一次条件。返回 (是否成立, 给人看的说明)。"""
+    cands = match_windows(args)
+    if not cands:
+        return False, "窗口还没出现"
+    if not want_uia:
+        c = cands[0]
+        return True, f"{c['hwnd_hex']} {c['process']} 「{c['title']}」"
+
+    from . import uia as uiamod
+    ok, why = uiamod.uia_available()
+    if not ok:
+        raise AppError(f"UI Automation 不可用：{why}", code=2)
+
+    for c in cands:
+        res = uiamod.find(c["hwnd"], name=args.uia_name, control_type=args.uia_type,
+                          automation_id=args.uia_id, class_name=args.uia_class,
+                          exact=args.uia_exact, interactive_only=args.uia_interactive,
+                          max_depth=args.uia_max_depth, limit=args.uia_limit)
+        if res.elements:
+            el = res.elements[0]
+            return True, (f"{c['hwnd_hex']} 里的 {el.control_type.lower()} "
+                          f"「{el.name}」{el.screen_center}")
+    return False, f"窗口在（{cands[0]['hwnd_hex']}），但没等到匹配的元素"
+
+
+def cmd_wait(args) -> int:
+    """
+    等一个条件成立，等不到就超时（退出码 6）。
+
+    为什么要有这条：agent 写自动化最难受的就是「点了之后要等一下，等多久合适？」
+    sleep 2 要么不够要么白等。直接 `wait && click` 串起来，成功才往下走。
+
+    用法：
+        bgclick --wait --title "记事本" --timeout 10
+        bgclick --wait --title "记事本" --uia-name "保存" --timeout 5
+        bgclick --wait --title "记事本" --gone
+    """
+    want_uia = bool(args.uia_name or args.uia_type or args.uia_id or args.uia_class)
+    if not (args.title or args.process or args.hwnd is not None):
+        raise AppError("--wait 至少需要一个定位条件：--title / --process / --hwnd")
+    if args.gone and want_uia:
+        raise AppError("--gone 只能等窗口消失，不支持等元素消失")
+
+    started = time.time()
+    deadline = started + max(0.0, args.timeout)
+    tries = 0
+    detail = ""
+
+    while True:
+        tries += 1
+        try:
+            hit, detail = _wait_condition(args, want_uia)
+        except AppError:
+            raise
+        except Exception as e:
+            hit, detail = False, f"检查出错：{type(e).__name__}: {e}"
+
+        if args.gone:
+            satisfied = not hit
+            success_text = "窗口已消失"
+        else:
+            satisfied = hit
+            success_text = f"等到了：{detail}"
+
+        elapsed = time.time() - started
+        if satisfied:
+            if args.json:
+                print(json.dumps({"ok": True, "waited": round(elapsed, 2),
+                                  "tries": tries, "detail": detail},
+                                 ensure_ascii=False))
+            else:
+                print(f"{success_text}（等了 {elapsed:.2f}s，轮询 {tries} 次）")
+            return 0
+
+        if time.time() >= deadline:      # ← 和绝对时间戳比，不是比 elapsed
+            if args.json:
+                print(json.dumps({"ok": False, "timeout": True,
+                                  "waited": round(elapsed, 2), "tries": tries,
+                                  "detail": detail}, ensure_ascii=False))
+            else:
+                print(f"超时 {elapsed:.1f}s：还在等条件成立。最后一次检查：{detail}",
+                      file=sys.stderr)
+            return EXIT_WAIT_TIMEOUT
+
+        time.sleep(max(0.05, args.interval))
+
+
 def cmd_uia(args) -> int:
     """UIA 元素查询：--uia-walk / --uia-find / --uia-click 共用一个入口。
 
@@ -1128,6 +1230,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         if args.list or args.list_all:
             code = cmd_list(args)
+        elif args.wait:
+            code = cmd_wait(args)
         elif args.scan:
             code = cmd_scan(args)
         elif args.doctor:
