@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bgclick"
+dynamic = ["version"]
+description = "后台操作 Windows 窗口：点击 / 键盘 / 滑动 / 截图，默认不抢光标和焦点。纯标准库，零第三方依赖。"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Christomas", email = "377985315@qq.com" }]
+keywords = [
+    "windows", "automation", "postmessage", "sendinput",
+    "ui-automation", "uia", "rpa", "agent", "mcp", "background",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Win32 (MS Windows)",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: User Interfaces",
+    "Topic :: System :: Desktop",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/christomas11/bgclick-win32"
+Repository = "https://github.com/christomas11/bgclick-win32"
+Issues = "https://github.com/christomas11/bgclick-win32/issues"
+
+[project.scripts]
+bgclick = "bgkit.bgclick.cli:main"
+bgserver = "bgkit.bgserver.cli:main"
+bgclient = "bgkit.bgclient.cli:main"
+bgtray = "bgkit.bgtray.cli:main"
+
+[tool.setuptools]
+packages = [
+    "bgkit",
+    "bgkit.bgclick",
+    "bgkit.bgclient",
+    "bgkit.bgserver",
+    "bgkit.bgtray",
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "bgkit.__version__" }
+
+[tool.setuptools.package-data]
+bgkit = ["assets/*.ico"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# 冒烟用例要开真实窗口，CI 上可能没有交互式 session，默认不收集
+markers = [
+    "smoke: 需要真实桌面会话的端到端用例",
+]
+addopts = "-ra"

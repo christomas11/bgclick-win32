@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from bgkit import ROOT
 from bgkit import bgclick as bc
-from bgkit import entry_script
+from bgkit import script_or_module
 import os
 import subprocess
 import sys
@@ -51,8 +51,9 @@ def relaunch_elevated(argv: list[str]) -> int:
         #   而 console=False 的 exe 看不到任何输出，表现就是「UAC 点完就闪退」。
         params = subprocess.list2cmdline(elevation_argv(argv))
     else:
-        script = entry_script("bgserver.py", "窗口工作.py")
-        params = subprocess.list2cmdline([script] + elevation_argv(argv))
+        # 开发树里用 bgserver.py，pip 安装版退回 python -m bgkit.bgserver
+        head = script_or_module("bgserver.py", "窗口工作.py", module="bgkit.bgserver")
+        params = subprocess.list2cmdline(head + elevation_argv(argv))
     print("正在申请管理员权限…… 屏幕上会弹 UAC，请点「是」。")
     try:
         rc = int(bc.shell32.ShellExecuteW(None, "runas", exe, params, os.getcwd(), 1))

@@ -7,9 +7,9 @@
 from __future__ import annotations
 
 from . import config
-from bgkit import ROOT
+from bgkit import asset_path
 from bgkit import bgclick as bc
-from bgkit import entry_script
+from bgkit import script_or_module
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import argparse
 import os
@@ -301,7 +301,9 @@ def _main_inner(args, argv: list[str]) -> int:
             if getattr(sys, "frozen", False):
                 cmd = [exe] + clean_argv
             else:
-                cmd = [exe, entry_script("bgserver.py", "窗口工作.py")] + clean_argv
+                # 开发树里用 bgserver.py，pip 安装版退回 python -m bgkit.bgserver
+                cmd = ([exe] + script_or_module("bgserver.py", "窗口工作.py",
+                                                module="bgkit.bgserver") + clean_argv)
 
             log.write(f"拉起新实例：{subprocess.list2cmdline(cmd)}")
             subprocess.Popen(cmd, cwd=launch_cwd, close_fds=True)
@@ -326,7 +328,7 @@ def _main_inner(args, argv: list[str]) -> int:
         tray = bgtray.TrayApp(
             title="bgclick 服务",
             tooltip=f"bgclick 服务运行中（{'管理员' if elevated else '普通用户'}，端口 {args.port}）",
-            icon_path=os.path.join(ROOT, "bgclick.ico"),
+            icon_path=asset_path("bgclick.ico"),
             menu_items=[
                 ("查看状态（双击我）", lambda: _open_path(log.path)),
                 ("-", lambda: None),

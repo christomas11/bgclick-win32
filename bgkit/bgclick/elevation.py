@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from bgkit import entry_script
+from bgkit import script_or_module
 import os
 import subprocess
 import sys
@@ -48,8 +48,9 @@ def _elevation_command(extra_args: list[str]) -> tuple[str, str]:
         # PyInstaller 打好的 exe：直接拿自己当可执行文件
         return sys.executable, subprocess.list2cmdline(argv)
 
-    script = entry_script("bgclick.py")
-    return _python_for_elevation(), subprocess.list2cmdline([script] + argv)
+    # 开发树里用 bgclick.py，pip 安装版退回 python -m bgkit.bgclick
+    head = script_or_module("bgclick.py", module="bgkit.bgclick")
+    return _python_for_elevation(), subprocess.list2cmdline(head + argv)
 
 
 def relaunch_as_admin(extra_args: list[str], verbose: bool = True) -> int:
