@@ -23,6 +23,7 @@ from .integrity import integrity_name, process_integrity, self_integrity
 from .keys import parse_pair
 from .messaging import probe_hierarchy, probe_window
 from .mouse import do_mouse
+from . import refstore
 from .screen import save_screenshot
 from .targeting import match_windows
 from .win32 import BUTTONS, ERROR_ACCESS_DENIED, user32
@@ -162,6 +163,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="匹配到多个元素时选第几个（默认 0）")
     p.add_argument("--uia-tree", action="store_true",
                    help="配合 --uia-find/--uia-click：以缩进树而非平铺列表输出")
+
+    # ---- 元素短引用（@e1）----
+    # 每次 --uia 扫描都会把结果编号存下来，之后用 --ref @e3 直接点，
+    # 不用再抄坐标。窗口挪了、分辨率变了也能点对。详见 bgkit/bgclick/refstore.py
+    p.add_argument("--ref", metavar="@e3",
+                   help="用上次 uia 扫描的编号定位目标（窗口挪了也能点对）")
+    p.add_argument("--allow-stale", action="store_true",
+                   help="允许使用超过 1 小时的旧扫描快照")
+    p.add_argument("--no-ref-save", action="store_true",
+                   help="uia 扫描后不保存编号（不想留下状态文件时用）")
     return p
 
 
@@ -451,10 +462,21 @@ def cmd_scan(args) -> int:
 def cmd_click(args) -> int:
     if args.count < 0:
         raise AppError("--count 不能为负数")
+
+    # --ref：先把编号解成「哪个窗口 + 哪个客户区坐标」，后面全部沿用原有通道
+    ref_hit = None
+    if args.ref:
+        ref_hit = refstore.resolve(args.ref, allow_stale=args.allow_stale)
+        args.hwnd = ref_hit["hwnd"]
+        if not args.title and not args.process:
+            # 让后面的窗口匹配直接用句柄，免得再按标题猜一遍
+            pass
+
+    has_pos = bool(args.pos or args.center or args.screen_pos or args.ref)
     # 给了 --fake-activate 但没给坐标 = 只做假激活、不点击（用来单独验证这一招）
-    only_activate = bool(args.fake_activate) and not (args.pos or args.center or args.screen_pos)
-    if not only_activate and not (args.pos or args.center or args.screen_pos):
-        raise AppError("必须指定 --pos / --center / --screen-pos 之一（-h 看帮助）")
+    only_activate = bool(args.fake_activate) and not has_pos
+    if not only_activate and not has_pos:
+        raise AppError("必须指定 --pos / --center / --screen-pos / --ref 之一（-h 看帮助）")
 
     cands = match_windows(args)
     if not cands:
@@ -504,12 +526,23 @@ def cmd_click(args) -> int:
         base = (cw // 2, ch // 2)
     elif args.pos:
         base = args.pos
-    else:
+    elif args.screen_pos:
         base = resolve_client_point(hwnd, *args.screen_pos)
+    else:
+        base = tuple(ref_hit["client_center"])     # --ref：编号里存好的客户区坐标
 
     if not (0 <= base[0] < cw and 0 <= base[1] < ch):
-        print(f"警告：基准坐标 {base} 落在客户区 {cw}x{ch} 之外，程序多半收不到这个点击",
-              file=sys.stderr)
+        # 走到了客户区外面 —— ref 的话很可能是界面变了，重扫一次再试
+        if ref_hit is not None:
+            new = refstore.refresh(args.ref)
+            if new is not None:
+                base = tuple(new["client_center"])
+                ref_hit = new
+                print(f"坐标越界，已重扫并把 {args.ref} 刷新到 {base}（元素可能移动过）。",
+                      file=sys.stderr)
+        if not (0 <= base[0] < cw and 0 <= base[1] < ch):
+            print(f"警告：基准坐标 {base} 落在客户区 {cw}x{ch} 之外，程序多半收不到这个点击",
+                  file=sys.stderr)
 
     meta = {
         "hwnd": hwnd,
@@ -518,6 +551,7 @@ def cmd_click(args) -> int:
         "process": target_info["process"],
         "client_size": [cw, ch],
         "base_pos": list(base),
+        "ref": ref_hit["ref"] if ref_hit else None,
         "button": args.button,
         "method": args.method,
         "count": args.count,
@@ -945,11 +979,19 @@ def cmd_uia(args) -> int:
         res = uiamod.walk(hwnd, max_depth=args.uia_max_depth, limit=args.uia_limit,
                           interactive_only=args.uia_interactive)
 
+    # --- 编号并落盘 ---
+    # 之后可以直接 click --ref @e3，不用抄坐标；界面动了还能自动重扫找回。
+    ref_map: dict[str, dict] = {}
+    if not args.no_ref_save:
+        ref_map = refstore.assign(res.elements, hwnd)
+        refstore.save(hwnd, ref_map)
+
     meta = {
         "hwnd": target_info["hwnd_hex"],
         "title": target_info["title"],
         "process": target_info["process"],
         "count": len(res.elements),
+        "refs_saved": len(ref_map),
         "truncated": res.truncated,
         "limit": res.limit,
         "visited": res.visited,
@@ -962,7 +1004,10 @@ def cmd_uia(args) -> int:
     if not want_click:
         payload = dict(meta)
         payload["ok"] = True
-        payload["elements"] = [e.to_dict(hwnd) for e in res.elements]
+        payload["elements"] = [
+            {**e.to_dict(hwnd), "ref": ref}
+            for ref, e in refstore.iter_refs(res.elements)
+        ]
         if args.json:
             print(json.dumps(payload, ensure_ascii=False, indent=2))
             return 0
@@ -973,13 +1018,16 @@ def cmd_uia(args) -> int:
               + ("（已达采集上限，结果是部分内容）" if res.truncated else ""))
         if res.failed_reason:
             print(f"注意：{res.failed_reason}")
+        if ref_map:
+            print(f"已编号 {len(ref_map)} 个元素 —— 点的时候用："
+                  f"--ref @e1（编号存在 %USERPROFILE%\\.bgclick\\refs.json）")
         print()
         if args.uia_tree or not by_condition:
-            print(uiamod.describe_tree(res, hwnd))
+            print(uiamod.describe_tree(res, hwnd, with_ref=True))
         else:
-            for i, e in enumerate(res.elements):
+            for ref, e in refstore.iter_refs(res.elements):
                 c = e.center_in_client(hwnd)
-                print(f"[{i}] {e.control_type.lower():<14}"
+                print(f"{ref or '  -  ':<5}{e.control_type.lower():<14}"
                       f"屏幕 {str(e.screen_center):<14}客户区 {str(c):<14}"
                       f"\"{e.name[:44]}\""
                       + ("  [可交互]" if e.is_interactive else ""))

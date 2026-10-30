@@ -24,6 +24,9 @@ from .cli import *  # noqa: F401,F403
 # 以模块形式暴露，用 bc.uia.walk(...) 调用。
 from . import uia  # noqa: F401
 
+# 元素短引用（@e1）的存取。load / save / resolve 这些名字太通用，同样以模块形式暴露。
+from . import refstore  # noqa: F401
+
 # 下划线开头的名字不会被 import * 带出，显式补上（老代码在用）
 from .screen import _HGDI_ERROR  # noqa: F401
 from .sendinput import _INPUTUNION  # noqa: F401

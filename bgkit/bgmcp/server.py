@@ -79,14 +79,19 @@ TOOLS: list[dict] = [
     _t(
         "click",
         "后台点击窗口。默认走 PostMessage 投递，不动你的光标和焦点。"
-        "坐标是客户区坐标（左上角为 0,0），可用 x/y、center 或 uia_name 指定位置。",
+        "坐标是客户区坐标（左上角为 0,0）。最稳的用法是先 uia_tree 拿到 ref，"
+        "再 click(ref=\"@e3\") —— 窗口挪了、分辨率变了也不会点错。",
         _TARGET_PROPS,
         extra={
+            "ref": {"type": "string",
+                    "description": "uia_tree 返回的元素编号，如 @e3。给了它就不用管坐标。"},
             "x": {"type": "integer", "description": "客户区 X"},
             "y": {"type": "integer", "description": "客户区 Y"},
+            "pos": {"type": "array", "items": {"type": "integer"},
+                    "description": "客户区坐标 [x,y]，等价于同时给 x 和 y"},
             "center": {"type": "boolean", "description": "点客户区正中心"},
-            "uia_name": {"type": "string",
-                         "description": "用 UIA 元素名定位，比坐标稳（窗口挪了也不怕）"},
+            "allow_stale": {"type": "boolean",
+                            "description": "配合 ref：允许使用超过 1 小时的旧扫描快照"},
             "button": {"type": "string", "enum": ["left", "right", "middle"]},
             "method": {
                 "type": "string",
@@ -153,8 +158,9 @@ TOOLS: list[dict] = [
     ),
     _t(
         "uia_tree",
-        "用 UI Automation 读窗口里的控件树。按名字/类型查元素并拿到屏幕坐标 —— "
-        "比截图数像素稳得多。不传筛选条件则返回整棵树。",
+        "用 UI Automation 读窗口里的控件树。按名字/类型查元素并拿到它们的编号和坐标 —— "
+        "比截图数像素稳得多。返回的每个元素都带 ref（@e1/@e2…），"
+        "之后可以直接 click(ref=\"@e3\")，不用管坐标。",
         _TARGET_PROPS,
         extra={
             "name": {"type": "string", "description": "按元素名筛选"},
@@ -239,7 +245,8 @@ class McpServer:
                 "postable": w.get("postable"),
             })
         return {"ok": True, "count": len(rows), "windows": rows,
-                "hint": "用 hwnd 指定目标；postable=false 的窗口后台投递会被 UIPI 拦，"
+                "hint": "拿到 hwnd 后用 uia_tree 扫出 @eN 编号，再 click(ref=\"@eN\") 最稳；"
+                        "postable=false 的窗口后台投递会被 UIPI 拦，"
                         "改用 method=hardware 或 sendinput"}
 
     def _tool_http(self, name: str, args: dict) -> dict:

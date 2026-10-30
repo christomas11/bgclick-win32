@@ -164,3 +164,106 @@ class TestMcpToolTable:
         for name in ("click", "screenshot", "uia_tree", "type_text"):
             tool = next(t for t in TOOLS if t["name"] == name)
             assert "hwnd" in tool["inputSchema"]["properties"], name
+
+
+class _FakeEl:
+    """假的 UIA 元素，只实现 refstore 用到的几个属性。"""
+
+    def __init__(self, name, rect):
+        self.name = name
+        self.rect = rect
+        self.control_type = "Button"
+        self.automation_id = "aid-" + name
+        self.class_name = "Btn"
+        self.is_interactive = True
+
+    @property
+    def screen_center(self):
+        if not self.rect:
+            return None
+        left, top, right, bottom = self.rect
+        return [left + (right - left) // 2, top + (bottom - top) // 2]
+
+    def center_in_client(self, hwnd=None):
+        c = self.screen_center
+        return [c[0] - 100, c[1] - 100] if c else None
+
+    def to_dict(self, hwnd=None):
+        return {
+            "name": self.name, "control_type": self.control_type,
+            "automation_id": self.automation_id, "class_name": self.class_name,
+            "rect": self.rect, "center": self.screen_center,
+            "client_center": self.center_in_client(hwnd),
+            "is_interactive": self.is_interactive,
+        }
+
+
+class TestRefStore:
+    """@eN 编号体系。编号错位 = 点到别的东西，所以规则必须锁死。"""
+
+    def test_normalize_accepts_three_forms(self):
+        from bgkit.bgclick import refstore
+        for raw in ("@e3", "e3", "3"):
+            assert refstore.normalize(raw) == "@e3"
+
+    def test_normalize_rejects_garbage(self):
+        from bgkit.bgclick import refstore
+        for raw in ("hello", "@x1", "", "e"):
+            with pytest.raises(refstore.RefError):
+                refstore.normalize(raw)
+
+    def test_assign_skips_elements_without_rect(self, tmp_path, monkeypatch):
+        from bgkit.bgclick import refstore
+        monkeypatch.setenv("BGCLICK_STATE_DIR", str(tmp_path))
+        els = [_FakeEl("a", [0, 0, 10, 10]),
+               _FakeEl("b", None),              # 没有坐标，不该占号
+               _FakeEl("c", [0, 0, 5, 5])]
+        mapping = refstore.assign(els, 123)
+        assert list(mapping) == ["@e1", "@e2"], "没坐标的元素不能占编号"
+        assert mapping["@e2"]["name"] == "c"
+
+    def test_tree_numbering_matches_saved_numbering(self, tmp_path, monkeypatch):
+        """describe_tree 显示的编号必须和 assign 存下来的完全一致。"""
+        from bgkit.bgclick import refstore
+        monkeypatch.setenv("BGCLICK_STATE_DIR", str(tmp_path))
+        els = [_FakeEl("a", [0, 0, 10, 10]), _FakeEl("b", None),
+               _FakeEl("c", [0, 0, 5, 5]), _FakeEl("d", [0, 0, 3, 3])]
+        shown = [(ref, el.name) for ref, el in refstore.iter_refs(els)]
+        saved = list(refstore.assign(els, 123))
+        assert [r for r, _ in shown if r] == saved
+        assert shown[1][0] is None
+
+    def test_roundtrip_save_and_resolve(self, tmp_path, monkeypatch):
+        from bgkit.bgclick import refstore
+        monkeypatch.setenv("BGCLICK_STATE_DIR", str(tmp_path))
+        import ctypes
+        from bgkit.bgclick.win32 import user32
+        # 自己这个进程的主窗口不一定有，拿桌面窗口的句柄来验「窗口存在」这一关
+        hwnd = user32.GetDesktopWindow()
+        refstore.save(hwnd, refstore.assign([_FakeEl("ok", [0, 0, 20, 20])], hwnd))
+        hit = refstore.resolve("@e1", allow_stale=True)
+        assert hit["hwnd"] == hwnd
+        assert hit["name"] == "ok"
+        assert hit["client_center"] == [-90, -90]
+
+    def test_resolve_without_any_scan(self, tmp_path, monkeypatch):
+        from bgkit.bgclick import refstore
+        monkeypatch.setenv("BGCLICK_STATE_DIR", str(tmp_path))
+        with pytest.raises(refstore.RefError, match="还没有任何扫描记录"):
+            refstore.resolve("@e1")
+
+    def test_resolve_unknown_ref_lists_available(self, tmp_path, monkeypatch):
+        from bgkit.bgclick import refstore
+        from bgkit.bgclick.win32 import user32
+        monkeypatch.setenv("BGCLICK_STATE_DIR", str(tmp_path))
+        hwnd = user32.GetDesktopWindow()
+        refstore.save(hwnd, refstore.assign([_FakeEl("a", [0, 0, 9, 9])], hwnd))
+        with pytest.raises(refstore.RefError, match="不在上次扫描结果里"):
+            refstore.resolve("@e7")
+
+    def test_resolve_dead_window(self, tmp_path, monkeypatch):
+        from bgkit.bgclick import refstore
+        monkeypatch.setenv("BGCLICK_STATE_DIR", str(tmp_path))
+        refstore.save(0xDEADBEEF, refstore.assign([_FakeEl("a", [0, 0, 9, 9])], 0xDEADBEEF))
+        with pytest.raises(refstore.RefError, match="已经不存在"):
+            refstore.resolve("@e1", allow_stale=True)

@@ -231,16 +231,27 @@ class Handler(BaseHTTPRequestHandler):
             res = uiamod.walk(hwnd, max_depth=max_depth, limit=limit,
                               interactive_only=interactive_only)
 
+        # 编号落盘：之后 /click 可以直接 {"ref": "@e3"}，不用抄坐标
+        try:
+            ref_map = bc.refstore.assign(res.elements, hwnd)
+            bc.refstore.save(hwnd, ref_map)
+        except Exception:
+            ref_map = {}
+
         payload = {
             "hwnd": hex(hwnd),
             "count": len(res.elements),
+            "refs_saved": len(ref_map),
             "truncated": res.truncated,
             "limit": res.limit,
             "visited": res.visited,
             "max_depth": res.max_depth,
             "elapsed": res.elapsed,
             "failed_reason": res.failed_reason,
-            "elements": [e.to_dict(hwnd) for e in res.elements],
+            "elements": [
+                {**e.to_dict(hwnd), "ref": ref}
+                for ref, e in bc.refstore.iter_refs(res.elements)
+            ],
         }
         return payload
 
@@ -310,6 +321,15 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, {"ok": True, "uia": payload})
 
     def _handle_click(self, body: dict) -> None:
+        # 支持 {"ref": "@e3"}：用上次扫描的编号定位，比坐标稳。
+        # 编号里自带 hwnd，所以这种请求不用再给 title / hwnd。
+        if body.get("ref") and not (body.get("hwnd") or body.get("title")
+                                    or body.get("process")):
+            hit = bc.refstore.resolve(body["ref"],
+                                      allow_stale=bool(body.get("allow_stale")))
+            body = dict(body)
+            body["hwnd"] = hit["hwnd"]
+            body.setdefault("pos", list(hit["client_center"]))
         target = find_target(body)
         max_clicks = self.server.max_clicks   # type: ignore[attr-defined]
         result = click_target(target, body, max_clicks)

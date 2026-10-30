@@ -962,14 +962,21 @@ def resolve_click_point(hwnd: int, name: Optional[str] = None,
 
 
 def describe_tree(result: WalkResult, hwnd: Optional[int] = None,
-                  max_lines: int = 200) -> str:
-    """把遍历结果画成缩进树，给人看 / 给 agent 看。"""
+                  max_lines: int = 200, with_ref: bool = False) -> str:
+    """把遍历结果画成缩进树，给人看 / 给 agent 看。
+
+    with_ref=True 时每行前面多一个 @eN 编号，可以直接喂给 `click --ref @eN`。
+    编号规则与 refstore.assign() 共用 iter_refs()，保证「看到的」就是「存下的」。
+    """
     if not result.elements:
         return f"没读到元素。（visited={result.visited}）" + (
             f"\n注意：{result.failed_reason}" if result.failed_reason else "")
 
+    from .refstore import iter_refs
+
     lines: list[str] = []
-    for el in result.elements[:max_lines]:
+    pairs = list(iter_refs(result.elements))
+    for ref, el in pairs[:max_lines]:
         if el.rect:
             pos = f"({el.screen_center[0]},{el.screen_center[1]})"
             size = f"{el.size[0]}x{el.size[1]}"
@@ -984,8 +991,11 @@ def describe_tree(result: WalkResult, hwnd: Optional[int] = None,
         if el.is_interactive:
             flags.append("interactive")
         flag_s = ("  [" + " ".join(flags) + "]") if flags else ""
+        ref_s = ""
+        if with_ref:
+            ref_s = (f"{ref:<5}" if ref else " " * 5)
         lines.append(
-            f"{'  ' * el.depth}{pos:<12}{el.control_type.lower():<14}"
+            f"{ref_s}{'  ' * el.depth}{pos:<12}{el.control_type.lower():<14}"
             f"{size:<12}\"{name[:48]}\"{flag_s}"
         )
     if len(result.elements) > max_lines:
