@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """bgkit.bgserver.config.py —— 运行配置：状态目录 / token / 端口 / pid
 
-从最初的单文件脚本拆出的一节。只做代码搬运，逻辑未改。
+从 窗口工作.py 拆出的一节（源文件第 117-207 行）。只做代码搬运，逻辑未改。
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import tempfile
 from typing import Optional
 
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 DEFAULT_PORT = 8765
 
 # 允许截图落盘的根目录（启动时填充为绝对路径）

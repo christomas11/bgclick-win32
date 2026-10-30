@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """bgkit.bgserver.api.py —— HTTP 接口处理
 
-从最初的单文件脚本拆出的一节。只做代码搬运，逻辑未改。
+从 窗口工作.py 拆出的一节（源文件第 367-831 行）。只做代码搬运，逻辑未改。
 """
 
 from __future__ import annotations
@@ -375,6 +375,10 @@ class Handler(BaseHTTPRequestHandler):
         hwnd = target["hwnd"]
         dest = _find_focus_window(hwnd) or hwnd
 
+        # WM_ACTIVATE 假激活（body["fake_activate"]，默认关）：
+        # 先让窗口「自以为在前台」，再投字符消息。详见 bgkit/bgclick/activation.py。
+        fa = bc.maybe_fake_activate(dest, body.get("fake_activate"))
+
         sent = 0
         for ch in text:
             ok, err = bc.post_checked(dest, 0x0102, ord(ch), 0)   # WM_CHAR
@@ -388,7 +392,10 @@ class Handler(BaseHTTPRequestHandler):
         if body.get("enter"):
             bc.post_checked(dest, 0x0100, 0x0D, 0)   # WM_KEYDOWN VK_RETURN
             bc.post_checked(dest, 0x0101, 0x0D, 0)   # WM_KEYUP
-        self._send(200, {"ok": True, "sent": sent, "target": hex(dest)})
+        payload = {"ok": True, "sent": sent, "target": hex(dest)}
+        if fa is not None:
+            payload["fake_activate"] = fa
+        self._send(200, payload)
 
     def _handle_key(self, body: dict) -> None:
         """
@@ -442,6 +449,10 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(0.15)
 
         dest = hwnd if method == "sendinput" else (_find_focus_window(hwnd) or hwnd)
+        # WM_ACTIVATE 假激活（body["fake_activate"]，默认关）——
+        # 真输入（sendinput）不走这条：它已经把窗口调到前台、抢的是真焦点。
+        fa = (bc.maybe_fake_activate(dest, body.get("fake_activate"))
+              if method != "sendinput" else None)
         repeat = clamp_int(body.get("repeat"), 1, 1000, "repeat", 1)
         interval = float(body.get("interval", 0.06))
         hold_gap = float(body.get("hold_gap", 0.02))
@@ -565,6 +576,8 @@ class Handler(BaseHTTPRequestHandler):
         result["hwnd"] = target["hwnd_hex"]
         result["title"] = target["title"]
         result["process"] = target["process"]
+        if fa is not None:
+            result["fake_activate"] = fa
         # 和 /click 一样：投递没成功就该让调用方看到失败（退出码 1）
         self._send(200 if result.get("ok") else 400,
                    {"ok": bool(result.get("ok")), "key": result, "target": hex(dest)})

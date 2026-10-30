@@ -134,6 +134,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--method", default="post", choices=["post", "send", "hardware"])
     sp.add_argument("--jitter", type=int, default=0, help="像素抖动")
     sp.add_argument("--activate", action="store_true", help="点击前激活窗口")
+    sp.add_argument("--fake-activate", action="store_true",
+                    help="★ WM_ACTIVATE 假激活：先让窗口「自以为在前台」再点，"
+                         "不抢焦点、不动光标（和 --activate 不是一回事）")
     sp.add_argument("--force-continue", action="store_true", help="失败也继续")
 
     sp = add("shot", "截图")
@@ -148,6 +151,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_target_args(sp)
     sp.add_argument("--text", required=True, help="要输入的文本")
     sp.add_argument("--enter", action="store_true", help="末尾补一个回车")
+    sp.add_argument("--fake-activate", action="store_true",
+                    help="★ WM_ACTIVATE 假激活：先让窗口「自以为在前台」再输入（不抢焦点）")
 
     sp = add("key", "键盘按键 / 组合键 / 多键同按（走 WM_KEYDOWN，不是 WM_CHAR）")
     add_target_args(sp)
@@ -180,6 +185,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="--type 时全部走按键消息，不发 WM_CHAR（给 IDE/游戏/画布）")
     sp.add_argument("--as-both", dest="text_mode", action="store_const", const="both",
                     help="--type 时两条通道都发（老行为，记事本这类控件会字符翻倍）")
+    sp.add_argument("--fake-activate", action="store_true",
+                    help="★ WM_ACTIVATE 假激活：先让窗口「自以为在前台」再按键"
+                         "（method=sendinput 时不生效 —— 那条本来就走真前台）")
 
     sp = add("mouse", "鼠标滑动 / 拖拽 / 滚轮（走消息投递，不动真实光标）")
     add_target_args(sp)
@@ -216,6 +224,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="sendinput 模式下逐点提交而不是整批（轨迹在时间上更像人手）")
     sp.add_argument("--no-restore-cursor", dest="restore_cursor", action="store_false",
                     default=True, help="hardware/sendinput 模式结束后不把光标放回原处")
+    sp.add_argument("--fake-activate", action="store_true",
+                    help="★ WM_ACTIVATE 假激活：滑动之前先给窗口投一条「你被激活了」，"
+                         "给「先查激活状态再理鼠标」的程序开后门（不抢焦点、不动光标）")
 
     sp = add("uia", "UIA 元素查询（按名字/类型找元素并拿坐标）")
     add_target_args(sp)
@@ -312,6 +323,7 @@ def main(argv: list[str] | None = None) -> int:
             body.update({"count": args.count, "interval": args.interval,
                          "button": args.button, "method": args.method,
                          "jitter": args.jitter, "activate": args.activate,
+                         "fake_activate": args.fake_activate,
                          "force_continue": args.force_continue})
             r = client.click(**body)
             human = None
@@ -338,14 +350,16 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.cmd == "text":
             body = target_payload(args)
-            body.update({"text": args.text, "enter": args.enter})
+            body.update({"text": args.text, "enter": args.enter,
+                         "fake_activate": args.fake_activate})
             return emit(client.text(**body), as_json)
 
         if args.cmd == "key":
             body = target_payload(args)
             body.update({"repeat": args.repeat, "method": args.method,
                          "hold_gap": args.hold_gap, "interval": args.interval,
-                         "scancode": args.scancode})
+                         "scancode": args.scancode,
+                         "fake_activate": args.fake_activate})
             if args.char is not None:
                 body["char"] = args.char
             human = None
@@ -374,6 +388,7 @@ def main(argv: list[str] | None = None) -> int:
             body.update({"method": args.method, "steps": args.steps, "hold": args.hold,
                          "ease": args.ease, "distance": args.distance,
                          "release": args.release, "batch": args.batch,
+                         "fake_activate": args.fake_activate,
                          "restore_cursor": args.restore_cursor})
             if args.delay != 0.02:
                 body["delay"] = args.delay

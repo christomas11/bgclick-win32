@@ -9,6 +9,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes as wintypes
 import time
+from .activation import maybe_fake_activate
 from .errors import AppError
 from .geometry import make_lparam, resolve_screen_point
 from .messaging import post_checked, probe_hierarchy
@@ -126,14 +127,24 @@ def send_click_hardware(hwnd: int, x: int, y: int, button: str = "left",
 
 
 def do_click(hwnd: int, x: int, y: int, args) -> dict:
+    # WM_ACTIVATE 假激活（args.fake_activate，默认关）：给「先检查激活状态
+    # 再处理鼠标消息」的程序开一条后台路。详见 activation.py。
+    pre = maybe_fake_activate(hwnd, getattr(args, "fake_activate", False))
+
     if args.method == "post":
-        return send_click_post(hwnd, x, y, args.button)
-    if args.method == "send":
-        return send_click_send(hwnd, x, y, args.button)
-    if args.method == "sendinput":
-        return send_input_click(hwnd, x, y, args.button,
-                                restore_cursor=getattr(args, "restore_cursor", True))
-    return send_click_hardware(hwnd, x, y, args.button, restore_cursor=args.restore_cursor)
+        rec = send_click_post(hwnd, x, y, args.button)
+    elif args.method == "send":
+        rec = send_click_send(hwnd, x, y, args.button)
+    elif args.method == "sendinput":
+        rec = send_input_click(hwnd, x, y, args.button,
+                               restore_cursor=getattr(args, "restore_cursor", True))
+    else:
+        rec = send_click_hardware(hwnd, x, y, args.button,
+                                  restore_cursor=args.restore_cursor)
+
+    if pre is not None:
+        rec["fake_activate"] = pre
+    return rec
 
 
 def send_input_click(hwnd: int, x: int, y: int, button: str = "left",

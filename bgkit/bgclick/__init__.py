@@ -10,6 +10,7 @@ from .targeting import *  # noqa: F401,F403
 from .geometry import *  # noqa: F401,F403
 from .integrity import *  # noqa: F401,F403
 from .messaging import *  # noqa: F401,F403
+from .activation import *  # noqa: F401,F403
 from .sendinput import *  # noqa: F401,F403
 from .keys import *  # noqa: F401,F403
 from .keyinput import *  # noqa: F401,F403

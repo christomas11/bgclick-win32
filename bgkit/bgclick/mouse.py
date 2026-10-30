@@ -10,6 +10,7 @@ import ctypes
 import ctypes.wintypes as wintypes
 import time
 from typing import Optional
+from .activation import maybe_fake_activate
 from .errors import AppError
 from .geometry import deepest_child_at, make_lparam, resolve_screen_point, window_dimensions
 from .messaging import _dispatch_key_msg, post_checked
@@ -383,6 +384,21 @@ def do_mouse(args, body: dict) -> dict:
     if not (0 <= delay <= 60):
         raise AppError("delay 必须在 0~60 秒之间", code=2)
 
+    # WM_ACTIVATE 假激活（body["fake_activate"]，默认关）——
+    # 在发任何鼠标消息**之前**，先给会收消息的那个窗口补一条「你被激活了」。
+    # 目标是「处理鼠标消息前先查自己是不是 active window，不是就 return」的程序。
+    # 发给默认会命中的那个窗口（钻到最深子控件）+ 它的祖先链，两边都照顾到。
+    # 详见 bgkit/bgclick/activation.py。
+    fa = None
+    if body.get("fake_activate") or getattr(args, "fake_activate", False):
+        fa_target = hwnd
+        if not body.get("no_deep"):
+            try:
+                fa_target = deepest_child_at(hwnd, start[0], start[1])[0] or hwnd
+            except Exception:
+                fa_target = hwnd
+        fa = maybe_fake_activate(fa_target, True)
+
     # --- 滚轮 ---
     if body.get("scroll") is not None:
         axis = str(body.get("axis", "vertical")).lower()
@@ -400,6 +416,8 @@ def do_mouse(args, body: dict) -> dict:
             rec = mouse_scroll(hwnd, start[0], start[1], amount, axis=axis,
                                method=method, delay=max(delay, 0.01))
         rec.update({"from": list(start), "hwnd": hex(hwnd)})
+        if fa is not None:
+            rec["fake_activate"] = fa
         return rec
 
     # --- 滑动路径 ---
@@ -455,6 +473,8 @@ def do_mouse(args, body: dict) -> dict:
     rec["steps"] = len(pts)
     rec["ease"] = bool(body.get("ease"))
     rec["hwnd"] = hex(hwnd)
+    if fa is not None:
+        rec["fake_activate"] = fa
     return rec
 
 

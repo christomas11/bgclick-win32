@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """bgkit.bgserver.security.py —— 参数校验与安全助手
 
-从最初的单文件脚本拆出的一节。只做代码搬运，逻辑未改。
+从 窗口工作.py 拆出的一节（源文件第 208-366 行）。只做代码搬运，逻辑未改。
 """
 
 from __future__ import annotations
@@ -129,6 +129,8 @@ def click_target(target: dict, body: dict, max_clicks: int) -> dict:
     args = argparse.Namespace(
         button=button, method=method, deep=not bool(body.get("no_deep")),
         restore_cursor=bool(body.get("restore_cursor", True)),
+        # WM_ACTIVATE 假激活：默认关，body 里显式给 fake_activate 才开
+        fake_activate=bool(body.get("fake_activate")),
     )
 
     if body.get("activate") and method != "hardware":

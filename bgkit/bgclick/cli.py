@@ -14,6 +14,7 @@ import random
 import sys
 import time
 from typing import Optional
+from .activation import fake_activate
 from .clicking import do_click, resolving_click
 from .elevation import elevation_would_help, relaunch_as_admin
 from .errors import AppError, describe_error
@@ -77,7 +78,12 @@ def build_parser() -> argparse.ArgumentParser:
                    default=True, help="hardware 模式下结束后把光标放回原处（默认就放回）")
     p.add_argument("--no-restore-cursor", dest="restore_cursor", action="store_false",
                    help="hardware 模式下不恢复光标（留在原地）")
-    p.add_argument("--activate", action="store_true", help="点击前先把窗口调到前台")
+    p.add_argument("--activate", action="store_true",
+                   help="点击前先把窗口调到前台（真抢焦点；不抢焦点的那种见 --fake-activate）")
+    p.add_argument("--fake-activate", action="store_true",
+                   help="★ WM_ACTIVATE 假激活：先给窗口投一条「你被激活了」再操作。"
+                        "给「处理鼠标消息前先查自己是不是 active window」的程序开后门，"
+                        "不抢焦点、不动光标；单独用（不给坐标）就只做假激活不点击")
     p.add_argument("--elevate", action="store_true",
                    help="立刻申请管理员权限重跑（不等检测，会弹 UAC）")
     p.add_argument("--no-elevate", dest="auto_elevate", action="store_false", default=True,
@@ -443,7 +449,9 @@ def cmd_scan(args) -> int:
 def cmd_click(args) -> int:
     if args.count < 0:
         raise AppError("--count 不能为负数")
-    if not (args.pos or args.center or args.screen_pos):
+    # 给了 --fake-activate 但没给坐标 = 只做假激活、不点击（用来单独验证这一招）
+    only_activate = bool(args.fake_activate) and not (args.pos or args.center or args.screen_pos)
+    if not only_activate and not (args.pos or args.center or args.screen_pos):
         raise AppError("必须指定 --pos / --center / --screen-pos 之一（-h 看帮助）")
 
     cands = match_windows(args)
@@ -467,6 +475,28 @@ def cmd_click(args) -> int:
             print(f"  {mark}[{i}] {c['hwnd_hex']:<12}{c['process'][:20]:<22}"
                   f"{c['client_size'][0]}x{c['client_size'][1]:<8}{c['title'][:40]}",
                   file=sys.stderr)
+
+    if only_activate:
+        # 只投假激活，不点击：验证「这个窗口吃不吃 WM_ACTIVATE」的干净入口
+        # ★ 必须在算坐标之前处理 —— 这条路本来就没有坐标，
+        #   走到下面 resolve_client_point(hwnd, *args.screen_pos) 会炸。
+        rec = fake_activate(hwnd)
+        rec.update({"hwnd": target_info["hwnd_hex"], "title": target_info["title"],
+                    "process": target_info["process"], "clicked": 0,
+                    "note": "只投递假激活，没有点击"})
+        if args.json:
+            print(json.dumps(rec, ensure_ascii=False))
+        else:
+            print(f"目标：{target_info['hwnd_hex']}  {target_info['process']}  "
+                  f"「{target_info['title']}」")
+            print(f"已投递 WM_ACTIVATE 给 {len(rec['targets'])} 个窗口："
+                  f"{' > '.join(rec['targets'])}" + ("（并带 WM_NCACTIVATE）" if rec["nc"] else ""))
+            print("★ 纯投递：没点击、没抢焦点、没动光标。系统层面的前台窗口没变。")
+            if not rec["ok"]:
+                print(f">>> 投递失败：{describe_error(rec['error'])}", file=sys.stderr)
+        if rec["ok"]:
+            return 0
+        return 4 if rec["error"] == ERROR_ACCESS_DENIED else 5
 
     if args.center:
         base = (cw // 2, ch // 2)
@@ -642,6 +672,7 @@ def cmd_swipe(args) -> int:
     body: dict = {"method": args.method, "delay": args.delay, "hold": args.hold,
                   "ease": args.ease, "no_deep": not args.deep,
                   "release": args.release, "steps": args.steps,
+                  "fake_activate": bool(args.fake_activate),
                   "restore_cursor": bool(getattr(args, "restore_cursor", True))}
     if args.from_pos:
         body["from"] = list(args.from_pos)
@@ -682,6 +713,8 @@ def cmd_swipe(args) -> int:
         print(f"目标：{target['hwnd_hex']}  {target['process']}  「{target['title'][:40]}」")
         print(f"{kind} / 方式 {args.method} / 步数 {args.steps}"
               + ("（平滑加减速）" if args.ease else ""))
+        if args.fake_activate:
+            print("★ --fake-activate：先投 WM_ACTIVATE 再动（不抢焦点、不动光标）")
         if real_input:
             print(f"★ {args.method} 真输入：会占用你的真实光标，期间别动鼠标。"
                   "若目标被遮挡，操作的是上层窗口。")
