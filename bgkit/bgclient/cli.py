@@ -15,6 +15,7 @@ import urllib.request
 from .bootstrap import _ping, ensure_server
 from .http import Client
 from .paths import DEFAULT_HOST, read_port
+from bgkit import __version__ as _bgkit_version
 
 
 
@@ -99,6 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="bgserver 客户端（默认输出 JSON，方便 agent 调用）",
         parents=[common],
     )
+    p.add_argument("--version", action="version", version=f"bgclient {_bgkit_version}")
     p.add_argument("--host", default=DEFAULT_HOST, help="服务地址（默认 127.0.0.1）")
     p.add_argument("--port", type=int, help="端口（默认读 .bgstate/port.txt）")
     p.add_argument("--token", help="token（默认读 .bgstate/token.txt）")

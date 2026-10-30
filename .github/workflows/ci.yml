@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: [ "3.8", "3.12" ]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 准备 Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 安装测试依赖
+        run: python -m pip install --upgrade pip pytest
+
+      - name: 跑测试
+        run: python -m pytest -q
+
+      - name: 构建并安装（验证打包配置）
+        run: |
+          python -m pip install . --no-deps
+          python -c "import bgkit; print('version:', bgkit.__version__)"
+          bgclick --version
+
+      - name: 验证四个入口都在
+        run: |
+          bgclick --list
+          bgclient --version
+          bgserver --help
+          bgtray --version
+
+      - name: 验证 MCP 握手
+        run: |
+          python -c "import json,subprocess,sys; p=subprocess.run([sys.executable,'-m','bgkit.bgmcp'],input='{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n',capture_output=True,text=True,encoding='utf-8'); d=json.loads(p.stdout.strip().splitlines()[0]); print(d['result']['serverInfo']); assert d['result']['serverInfo']['name']=='bgclick'"
+
+      - name: 验证零第三方依赖
+        run: |
+          python -c "import importlib.metadata as m; reqs=m.requires('bgclick') or []; print('dependencies:', reqs); assert not reqs, '这个项目必须零依赖'"

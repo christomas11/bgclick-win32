@@ -61,7 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=0, help="默认读端口文件")
     p.add_argument("--icon", default="", help="托盘图标路径，默认用包内 bgclick.ico")
     p.add_argument("--status", action="store_true", help="只查一次状态就退出（不开托盘）")
-    p.add_argument("--version", action="version", version=f"bgkit {__version__}")
+    p.add_argument("--version", action="version", version=f"bgtray {__version__}")
     return p
 
 

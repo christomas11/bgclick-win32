@@ -27,6 +27,7 @@ from .screen import save_screenshot
 from .targeting import match_windows
 from .win32 import BUTTONS, ERROR_ACCESS_DENIED, user32
 from .wininfo import describe, enable_dpi_awareness, is_admin, iter_top_level_windows, process_is_elevated, process_name, window_class, window_pid, window_title
+from bgkit import __version__ as _bgkit_version
 
 
 
@@ -41,6 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="对指定窗口后台点击（PostMessage 投递，不抢光标/焦点）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    p.add_argument("--version", action="version", version=f"bgclick {_bgkit_version}")
     p.add_argument("--list", action="store_true", help="列出可见窗口后退出")
     p.add_argument("--list-all", action="store_true", help="列出全部顶层窗口（含隐藏）后退出")
     p.add_argument("--doctor", action="store_true", help="只读诊断：为什么点不动")

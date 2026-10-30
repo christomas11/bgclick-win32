@@ -32,6 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="bgserver.py",
         description="后台点击/截图的常驻本地服务（仅监听 127.0.0.1）",
     )
+    p.add_argument("--version", action="version", version=f"bgserver {VERSION}")
     p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"端口（默认 {DEFAULT_PORT}）")
     p.add_argument("--token", help="固定 token（默认自动生成并存在 .bgstate/token.txt）")
     p.add_argument("--elevate", action="store_true", help="启动时申请管理员权限（默认自动）")

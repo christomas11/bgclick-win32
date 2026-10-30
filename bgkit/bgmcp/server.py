@@ -337,19 +337,28 @@ class McpServer:
 
 
 def serve(stdin=None, stdout=None) -> int:
-    # stdout 是协议通道。先把它抢过来，再把 sys.stdout 指到 stderr，
+    # stdout 是协议通道。真跑 stdio 时先把它抢过来，再把 sys.stdout 指到 stderr，
     # 这样任何库里的 print 都不会污染协议流。
-    out = stdout or sys.stdout
-    try:
-        out.reconfigure(encoding="utf-8", newline="\n")  # type: ignore[attr-defined]
-    except Exception:
-        pass
+    # 传了 stdout（测试场景）就不动全局状态，免得把调用方的输出抢走。
+    if stdout is None:
+        out = sys.stdout
+        try:
+            out.reconfigure(encoding="utf-8", newline="\n")  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        sys.stdout = sys.stderr
+    else:
+        out = stdout
+        try:
+            out.reconfigure(encoding="utf-8", newline="\n")  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
     inp = stdin or sys.stdin
     try:
         inp.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
     except Exception:
         pass
-    sys.stdout = sys.stderr
 
     server = McpServer()
     for line in inp:
@@ -382,7 +391,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         prog="bgmcp",
         description="bgclick 的 MCP server（stdio）。给 Claude Desktop / Cursor 等客户端用。",
     )
-    p.add_argument("--version", action="version", version=f"bgkit {__version__}")
+    p.add_argument("--version", action="version", version=f"bgmcp {__version__}")
     p.parse_args(argv)
     try:
         return serve()

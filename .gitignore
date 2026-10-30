@@ -23,3 +23,9 @@ shots/
 # 运行时状态与日志（正常状态目录在 %USERPROFILE%\.bgclick，这里兜底）
 .bgstate/
 *.log
+
+# 打包与测试产物
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
