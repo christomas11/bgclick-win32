@@ -33,6 +33,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="后台点击/截图的常驻本地服务（仅监听 127.0.0.1）",
     )
     p.add_argument("--version", action="version", version=f"bgserver {VERSION}")
+    p.add_argument("--no-auth", action="store_true",
+                   help="关闭 token 鉴权（仅本机调试用；同机任何程序都能调这个服务了）")
     p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"端口（默认 {DEFAULT_PORT}）")
     p.add_argument("--token", help="固定 token（默认自动生成并存在 .bgstate/token.txt）")
     p.add_argument("--elevate", action="store_true", help="启动时申请管理员权限（默认自动）")
@@ -160,7 +162,7 @@ def _main_inner(args, argv: list[str]) -> int:
     for r in ALLOWED_SHOT_ROOTS:
         os.makedirs(r, exist_ok=True)
 
-    token = load_or_create_token(args.token)
+    token = "" if args.no_auth else load_or_create_token(args.token)
 
     # 只绑本机回环地址 —— 这条是硬安全边界，不要改
     bind_host = "127.0.0.1"
@@ -199,7 +201,10 @@ def _main_inner(args, argv: list[str]) -> int:
     log.write(f"  权限     : {'管理员 ✔' if elevated else '普通用户 ✘（很多窗口会点不动）'}")
     log.write(f"  完整性级 : {bc.integrity_name(bc.self_integrity())}")
     log.write(f"  托盘     : {'开' if args.tray else '关（--no-tray）'}")
-    log.write(f"  token    : {token_path()}")
+    if token:
+        log.write(f"  token    : {token_path()}")
+    else:
+        log.write("  token    : 已关闭（--no-auth）★ 同机任何程序都能调用本服务")
     log.write(f"  截图目录 : {', '.join(ALLOWED_SHOT_ROOTS)}")
     log.write(f"  日志     : {log.path}")
     log.write("=" * 60)

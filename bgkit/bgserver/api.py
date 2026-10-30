@@ -50,12 +50,17 @@ class Handler(BaseHTTPRequestHandler):
         if not check_host_header(self.headers.get("Host")):
             self._send(403, {"ok": False, "error": "Host 头不被接受（只允许本机访问）"})
             return False
+        token = getattr(self.server, "token", "")
+        if not token:
+            # --no-auth：显式关掉鉴权。只该在「本机调试 / 老脚本没改」时用，
+            # 服务启动时会打一条醒目警告。
+            return True
         auth = self.headers.get("Authorization", "")
-        expected = f"Bearer {self.server.token}"  # type: ignore[attr-defined]
+        expected = f"Bearer {token}"
         if not secrets.compare_digest(auth, expected):
             self._send(401, {"ok": False,
                              "error": "缺少或错误的 token。用 bgclient.py，"
-                                      "或读 .bgstate/token.txt"})
+                                      "或读 %USERPROFILE%\\.bgclick\\token.txt"})
             return False
         return True
 
@@ -93,7 +98,7 @@ class Handler(BaseHTTPRequestHandler):
                 "elevated": bc.is_admin(),
                 "integrity": bc.integrity_name(bc.self_integrity()),
                 "pid": os.getpid(), "uptime": round(time.time() - self.server.started, 1),
-                "needs_token": True,
+                "needs_token": bool(getattr(self.server, "token", "")),
                 "uia": {"available": uia_ok, "message": uia_msg},
             })
             return
